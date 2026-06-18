@@ -746,14 +746,14 @@ if __name__ == "__main__":
                     rows.append((sym, name, sec, db.now()))
 
             if rows:
-                _collector.db.runmany("""
-                    INSERT INTO stocks (symbol, company_name, sector, created_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (symbol) DO UPDATE SET
-                        company_name = EXCLUDED.company_name,
-                        sector       = EXCLUDED.sector
-
-                """, rows)
+                for row in rows:
+                    _collector.db.run("""
+                        INSERT INTO stocks (symbol, company_name, sector, created_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            company_name = EXCLUDED.company_name,
+                            sector       = EXCLUDED.sector
+                    """, list(row))
             log.info(f"Synced {len(rows)} securities")
         else:
             log.error("Could not fetch securities list")
