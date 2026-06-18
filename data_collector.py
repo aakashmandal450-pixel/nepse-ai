@@ -751,8 +751,8 @@ if __name__ == "__main__":
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT (symbol) DO UPDATE SET
                         company_name = EXCLUDED.company_name,
-                        sector       = EXCLUDED.sector,
-                        updated_at   = EXCLUDED.created_at
+                        sector       = EXCLUDED.sector
+
                 """, rows)
             log.info(f"Synced {len(rows)} securities")
         else:

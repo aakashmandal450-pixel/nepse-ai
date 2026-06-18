@@ -24,7 +24,13 @@ def _to_pg(sql: str) -> str:
     sql = sql.replace("?", "%s")
     sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
     sql = re.sub(r'\bREAL\b', "DOUBLE PRECISION", sql)
-    sql = re.sub(r'INSERT OR IGNORE INTO', "INSERT INTO", sql)
+    # For INSERT OR IGNORE: convert to INSERT ... ON CONFLICT DO NOTHING
+    sql = re.sub(r'INSERT OR IGNORE INTO\s+(\w+)',
+                 lambda m: f'INSERT INTO {m.group(1)}', sql)
+    if re.search(r'INSERT OR IGNORE', sql, re.IGNORECASE):
+        sql = re.sub(r'INSERT OR IGNORE', 'INSERT', sql, flags=re.IGNORECASE)
+        if 'ON CONFLICT' not in sql.upper():
+            sql = sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
     sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql)
     return sql
 
@@ -197,7 +203,7 @@ class DB:
     def conn(self):
         if self._pg:
             import psycopg2
-            return psycopg2.connect(DATABASE_URL)
+            return psycopg2.connect(DATABASE_URL, sslmode="require")
         else:
             import sqlite3
             c = sqlite3.connect(DB_PATH, timeout=30)
@@ -325,12 +331,3 @@ class DB:
 
 db = DB()
 Database = DB
-
-
-if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
-    print("Initializing database tables...")
-    db.init()
-    print("Database initialization complete.")
