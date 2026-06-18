@@ -1,230 +1,336 @@
 """
-=============================================================
-  NEPSE AI TRADER — db_manager.py
-  Database schema + query helpers. Flat import version.
-=============================================================
+NEPSE AI — db_manager.py
+Supports both PostgreSQL (Supabase) and SQLite.
+  - Set DATABASE_URL env variable → uses PostgreSQL (Supabase/production).
+  - No DATABASE_URL → falls back to SQLite (local development).
 """
-import sqlite3, logging, os
+import os, logging, re
 from datetime import datetime
-from settings import USE_SQLITE, SQLITE_PATH, DATABASE
 
 logger = logging.getLogger(__name__)
 
-TABLES = [
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES  = bool(DATABASE_URL)
+
+if not USE_POSTGRES:
+    try:
+        from settings import DB_PATH
+    except ImportError:
+        DB_PATH = "nepse_ai.db"
+
+
+def _to_pg(sql: str) -> str:
+    """Convert SQLite SQL syntax to PostgreSQL."""
+    sql = sql.replace("?", "%s")
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    sql = re.sub(r'\bREAL\b', "DOUBLE PRECISION", sql)
+    sql = re.sub(r'INSERT OR IGNORE INTO', "INSERT INTO", sql)
+    sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql)
+    return sql
+
+
+PG_TABLES = [
     ("stocks", """CREATE TABLE IF NOT EXISTS stocks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT UNIQUE NOT NULL,
+        id SERIAL PRIMARY KEY, symbol TEXT UNIQUE NOT NULL,
         company_name TEXT, sector TEXT, sub_sector TEXT,
-        listed_shares REAL, paid_up_value REAL, market_cap REAL,
+        listed_shares DOUBLE PRECISION, public_shares DOUBLE PRECISION,
+        promoter_shares DOUBLE PRECISION, free_float_pct DOUBLE PRECISION,
+        paid_up_value DOUBLE PRECISION DEFAULT 100, market_cap DOUBLE PRECISION,
         is_active INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT)"""),
 
-    ("live_market", """CREATE TABLE IF NOT EXISTS live_market (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-        ltp REAL, point_change REAL, pct_change REAL,
-        open_price REAL, high_price REAL, low_price REAL, volume INTEGER,
-        prev_close REAL, turnover REAL, week52_high REAL, week52_low REAL,
-        total_trades INTEGER, snapshot_time TEXT NOT NULL, created_at TEXT)"""),
-
     ("daily_ohlcv", """CREATE TABLE IF NOT EXISTS daily_ohlcv (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-        trade_date TEXT NOT NULL, open_price REAL, high_price REAL,
-        low_price REAL, close_price REAL, adj_close REAL, volume INTEGER,
-        turnover REAL, total_trades INTEGER, created_at TEXT,
-        UNIQUE(symbol, trade_date))"""),
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, trade_date TEXT NOT NULL,
+        open_price DOUBLE PRECISION, high_price DOUBLE PRECISION,
+        low_price DOUBLE PRECISION, close_price DOUBLE PRECISION,
+        adj_close DOUBLE PRECISION, volume BIGINT, turnover DOUBLE PRECISION,
+        total_trades INTEGER, created_at TEXT, UNIQUE(symbol, trade_date))"""),
 
-    ("stock_fundamentals", """CREATE TABLE IF NOT EXISTS stock_fundamentals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-        report_date TEXT NOT NULL, eps REAL, pe_ratio REAL, book_value REAL,
-        price_to_book REAL, roe REAL, dividend_yield REAL, market_cap REAL,
-        free_float_pct REAL, created_at TEXT, UNIQUE(symbol, report_date))"""),
-
-    ("floorsheet", """CREATE TABLE IF NOT EXISTS floorsheet (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, transaction_id TEXT UNIQUE,
-        trade_date TEXT NOT NULL, symbol TEXT NOT NULL,
-        buyer_broker INTEGER, seller_broker INTEGER,
-        quantity INTEGER, rate REAL, amount REAL, trade_time TEXT, created_at TEXT)"""),
-
-    ("brokers", """CREATE TABLE IF NOT EXISTS brokers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, broker_number INTEGER UNIQUE NOT NULL,
-        broker_name TEXT, location TEXT, created_at TEXT)"""),
-
-    ("broker_daily_activity", """CREATE TABLE IF NOT EXISTS broker_daily_activity (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT NOT NULL,
-        symbol TEXT NOT NULL, broker_number INTEGER NOT NULL,
-        buy_quantity INTEGER DEFAULT 0, buy_amount REAL DEFAULT 0,
-        sell_quantity INTEGER DEFAULT 0, sell_amount REAL DEFAULT 0,
-        net_quantity INTEGER, net_amount REAL,
-        buy_trades INTEGER DEFAULT 0, sell_trades INTEGER DEFAULT 0,
-        created_at TEXT, UNIQUE(trade_date, symbol, broker_number))"""),
-
-    ("broker_concentration", """CREATE TABLE IF NOT EXISTS broker_concentration (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT NOT NULL,
-        symbol TEXT NOT NULL, top3_buy_pct REAL, top3_sell_pct REAL,
-        top_buyer_broker INTEGER, top_buyer_qty INTEGER,
-        top_seller_broker INTEGER, top_seller_qty INTEGER,
-        unique_buyers INTEGER, unique_sellers INTEGER,
-        accumulation_score REAL, created_at TEXT, UNIQUE(trade_date, symbol))"""),
+    ("live_market", """CREATE TABLE IF NOT EXISTS live_market (
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL,
+        ltp DOUBLE PRECISION, pct_change DOUBLE PRECISION,
+        open_price DOUBLE PRECISION, high_price DOUBLE PRECISION,
+        low_price DOUBLE PRECISION, volume BIGINT, turnover DOUBLE PRECISION,
+        snapshot_time TEXT NOT NULL, created_at TEXT,
+        UNIQUE(symbol, snapshot_time))"""),
 
     ("indices", """CREATE TABLE IF NOT EXISTS indices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, index_name TEXT NOT NULL,
-        index_date TEXT NOT NULL, open_value REAL, high_value REAL,
-        low_value REAL, close_value REAL, pct_change REAL, point_change REAL,
-        turnover REAL, snapshot_time TEXT, created_at TEXT,
-        UNIQUE(index_name, index_date, snapshot_time))"""),
+        id SERIAL PRIMARY KEY, index_name TEXT NOT NULL, index_date TEXT,
+        close_value DOUBLE PRECISION, current_value DOUBLE PRECISION,
+        change DOUBLE PRECISION, pct_change DOUBLE PRECISION,
+        per_change DOUBLE PRECISION, turnover DOUBLE PRECISION,
+        created_at TEXT, UNIQUE(index_name, index_date))"""),
 
-    ("top_movers", """CREATE TABLE IF NOT EXISTS top_movers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trade_date TEXT NOT NULL,
-        snapshot_time TEXT NOT NULL, category TEXT NOT NULL, rank_position INTEGER,
-        symbol TEXT NOT NULL, value REAL, ltp REAL, pct_change REAL,
-        volume INTEGER, created_at TEXT)"""),
+    ("floorsheet", """CREATE TABLE IF NOT EXISTS floorsheet (
+        id SERIAL PRIMARY KEY, contract_no TEXT UNIQUE, symbol TEXT,
+        buyer_broker TEXT, seller_broker TEXT, quantity DOUBLE PRECISION,
+        rate DOUBLE PRECISION, amount DOUBLE PRECISION,
+        trade_date TEXT, created_at TEXT)"""),
 
-    ("corporate_actions", """CREATE TABLE IF NOT EXISTS corporate_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-        action_type TEXT NOT NULL, announcement_date TEXT, ex_date TEXT,
-        book_close_date TEXT, record_date TEXT, effective_date TEXT,
-        value REAL, cash_per_share REAL, remarks TEXT, created_at TEXT,
-        UNIQUE(symbol, action_type, announcement_date))"""),
+    ("broker_analysis", """CREATE TABLE IF NOT EXISTS broker_analysis (
+        id SERIAL PRIMARY KEY, trade_date TEXT NOT NULL, broker_id TEXT NOT NULL,
+        total_buy_amount DOUBLE PRECISION DEFAULT 0,
+        total_sell_amount DOUBLE PRECISION DEFAULT 0,
+        total_buy_qty DOUBLE PRECISION DEFAULT 0,
+        total_sell_qty DOUBLE PRECISION DEFAULT 0,
+        created_at TEXT, UNIQUE(trade_date, broker_id))"""),
+
+    ("broker_concentration", """CREATE TABLE IF NOT EXISTS broker_concentration (
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, trade_date TEXT NOT NULL,
+        top3_buy_pct DOUBLE PRECISION, top3_sell_pct DOUBLE PRECISION,
+        unique_buyers INTEGER, unique_sellers INTEGER,
+        avg_trade_size DOUBLE PRECISION, large_trades_pct DOUBLE PRECISION,
+        accumulation_score DOUBLE PRECISION, wyckoff_phase TEXT,
+        created_at TEXT, UNIQUE(symbol, trade_date))"""),
 
     ("technical_indicators", """CREATE TABLE IF NOT EXISTS technical_indicators (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
-        calc_date TEXT NOT NULL, ema9 REAL, ema21 REAL, ema50 REAL, ema200 REAL,
-        macd_line REAL, macd_signal REAL, macd_histogram REAL, adx REAL,
-        rsi14 REAL, stoch_k REAL, stoch_d REAL, cci14 REAL, williams_r REAL,
-        obv REAL, vwap REAL, volume_ma20 REAL, volume_ratio REAL, cmf REAL,
-        atr14 REAL, bb_upper REAL, bb_middle REAL, bb_lower REAL,
-        bb_pct_b REAL, bb_squeeze INTEGER,
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, calc_date TEXT NOT NULL,
+        ema9 DOUBLE PRECISION, ema21 DOUBLE PRECISION,
+        ema50 DOUBLE PRECISION, ema200 DOUBLE PRECISION,
+        macd_line DOUBLE PRECISION, macd_signal DOUBLE PRECISION,
+        macd_histogram DOUBLE PRECISION, adx DOUBLE PRECISION,
+        adx_plus_di DOUBLE PRECISION, adx_minus_di DOUBLE PRECISION,
+        rsi14 DOUBLE PRECISION, stoch_k DOUBLE PRECISION, stoch_d DOUBLE PRECISION,
+        cci14 DOUBLE PRECISION, williams_r DOUBLE PRECISION, roc10 DOUBLE PRECISION,
+        obv DOUBLE PRECISION, vwap DOUBLE PRECISION,
+        volume_ma20 DOUBLE PRECISION, volume_ratio DOUBLE PRECISION,
+        cmf DOUBLE PRECISION, mfi14 DOUBLE PRECISION,
+        atr14 DOUBLE PRECISION, atr_pct DOUBLE PRECISION,
+        bb_upper DOUBLE PRECISION, bb_middle DOUBLE PRECISION,
+        bb_lower DOUBLE PRECISION, bb_pct_b DOUBLE PRECISION,
+        bb_bandwidth DOUBLE PRECISION, bb_squeeze INTEGER DEFAULT 0,
+        float_adj_volume DOUBLE PRECISION, relative_strength DOUBLE PRECISION,
+        dist_from_52w_high DOUBLE PRECISION, dist_from_52w_low DOUBLE PRECISION,
         pattern_doji INTEGER DEFAULT 0, pattern_hammer INTEGER DEFAULT 0,
-        pattern_shooting_star INTEGER DEFAULT 0, pattern_engulf_bull INTEGER DEFAULT 0,
-        pattern_engulf_bear INTEGER DEFAULT 0, pattern_morning_star INTEGER DEFAULT 0,
-        pattern_evening_star INTEGER DEFAULT 0, signal_strength REAL, created_at TEXT,
+        pattern_engulf_bull INTEGER DEFAULT 0, pattern_engulf_bear INTEGER DEFAULT 0,
+        pattern_morning_star INTEGER DEFAULT 0, pattern_evening_star INTEGER DEFAULT 0,
+        pattern_shooting_star INTEGER DEFAULT 0,
+        signal_strength DOUBLE PRECISION, created_at TEXT,
         UNIQUE(symbol, calc_date))"""),
 
+    ("fundamentals", """CREATE TABLE IF NOT EXISTS fundamentals (
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, report_date TEXT NOT NULL,
+        eps DOUBLE PRECISION, pe_ratio DOUBLE PRECISION,
+        book_value DOUBLE PRECISION, price_to_book DOUBLE PRECISION,
+        roe DOUBLE PRECISION, dividend_yield DOUBLE PRECISION,
+        created_at TEXT, UNIQUE(symbol, report_date))"""),
+
+    ("corporate_actions", """CREATE TABLE IF NOT EXISTS corporate_actions (
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL,
+        action_type TEXT, action_value TEXT,
+        value DOUBLE PRECISION, cash_per_share DOUBLE PRECISION,
+        book_close_date TEXT, ex_date TEXT, announcement_date TEXT,
+        created_at TEXT)"""),
+
     ("news", """CREATE TABLE IF NOT EXISTS news (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, headline TEXT NOT NULL,
-        summary TEXT, url TEXT UNIQUE, source TEXT, published_at TEXT,
-        symbols_mentioned TEXT, category TEXT, sentiment_score REAL,
-        sentiment_label TEXT, created_at TEXT)"""),
+        id SERIAL PRIMARY KEY, news_id TEXT UNIQUE,
+        headline TEXT, title TEXT, source TEXT, category TEXT,
+        content TEXT, news_date TEXT, published_at TEXT,
+        sentiment_score DOUBLE PRECISION DEFAULT 0,
+        sentiment_label TEXT DEFAULT 'neutral', created_at TEXT)"""),
 
     ("ai_signals", """CREATE TABLE IF NOT EXISTS ai_signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, signal_date TEXT NOT NULL,
-        target_date TEXT NOT NULL, symbol TEXT NOT NULL, signal TEXT NOT NULL,
-        confidence_pct REAL, predicted_move_pct REAL, stop_loss_price REAL,
-        target_price REAL, risk_reward REAL, key_drivers TEXT, model_version TEXT,
-        actual_close REAL, actual_pct_change REAL, signal_correct INTEGER,
-        created_at TEXT, UNIQUE(signal_date, symbol))"""),
+        id SERIAL PRIMARY KEY, signal_date TEXT NOT NULL,
+        target_date TEXT, symbol TEXT NOT NULL, signal TEXT,
+        confidence_pct DOUBLE PRECISION, ltp DOUBLE PRECISION,
+        target_10d DOUBLE PRECISION, target_20d DOUBLE PRECISION,
+        stop_loss DOUBLE PRECISION, risk_reward DOUBLE PRECISION,
+        upside_prob_10d DOUBLE PRECISION, downside_prob_10d DOUBLE PRECISION,
+        strategy TEXT, wyckoff_phase TEXT, time_series_type TEXT,
+        rsi_at_signal DOUBLE PRECISION, macd_at_signal DOUBLE PRECISION,
+        volume_ratio_at_signal DOUBLE PRECISION, accumulation_score DOUBLE PRECISION,
+        beta_3m DOUBLE PRECISION, pe_ratio DOUBLE PRECISION, atr_pct DOUBLE PRECISION,
+        key_drivers TEXT, model_version TEXT,
+        actual_close_10d DOUBLE PRECISION, actual_pct_10d DOUBLE PRECISION,
+        signal_correct INTEGER, created_at TEXT,
+        UNIQUE(signal_date, symbol))"""),
+
+    ("price_projections", """CREATE TABLE IF NOT EXISTS price_projections (
+        id SERIAL PRIMARY KEY, symbol TEXT NOT NULL,
+        projection_date TEXT NOT NULL, horizon_days INTEGER NOT NULL,
+        current_price DOUBLE PRECISION, target_price DOUBLE PRECISION,
+        upside_price DOUBLE PRECISION, downside_price DOUBLE PRECISION,
+        probability_up DOUBLE PRECISION, probability_down DOUBLE PRECISION,
+        atr_based DOUBLE PRECISION, method TEXT, created_at TEXT,
+        UNIQUE(symbol, projection_date, horizon_days))"""),
+
+    ("top_movers", """CREATE TABLE IF NOT EXISTS top_movers (
+        id SERIAL PRIMARY KEY, trade_date TEXT NOT NULL,
+        symbol TEXT NOT NULL, category TEXT NOT NULL,
+        value DOUBLE PRECISION, ltp DOUBLE PRECISION,
+        volume BIGINT, pct_change DOUBLE PRECISION,
+        created_at TEXT, UNIQUE(trade_date, symbol, category))"""),
 
     ("scraper_log", """CREATE TABLE IF NOT EXISTS scraper_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, module TEXT NOT NULL,
-        status TEXT NOT NULL, records_saved INTEGER DEFAULT 0,
-        error_message TEXT, started_at TEXT, finished_at TEXT,
-        duration_sec REAL, created_at TEXT)"""),
+        id SERIAL PRIMARY KEY, module TEXT, status TEXT,
+        records INTEGER DEFAULT 0, error TEXT,
+        duration_s DOUBLE PRECISION, created_at TEXT)"""),
 ]
 
-INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_live       ON live_market(symbol, snapshot_time)",
-    "CREATE INDEX IF NOT EXISTS idx_ohlcv      ON daily_ohlcv(symbol, trade_date DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_floor_sym  ON floorsheet(symbol, trade_date DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_floor_buy  ON floorsheet(buyer_broker, trade_date DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_broker_act ON broker_daily_activity(trade_date DESC, symbol)",
-    "CREATE INDEX IF NOT EXISTS idx_idx        ON indices(index_name, index_date DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_movers     ON top_movers(trade_date DESC, category)",
-    "CREATE INDEX IF NOT EXISTS idx_corp       ON corporate_actions(symbol, ex_date DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_news       ON news(published_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_signals    ON ai_signals(signal_date DESC, symbol)",
-    "CREATE INDEX IF NOT EXISTS idx_ti         ON technical_indicators(symbol, calc_date DESC)",
+PG_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_ohlcv          ON daily_ohlcv(symbol, trade_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_live_market     ON live_market(symbol, snapshot_time DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_indices         ON indices(index_name, index_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_floorsheet      ON floorsheet(symbol, trade_date)",
+    "CREATE INDEX IF NOT EXISTS idx_broker_conc     ON broker_concentration(symbol, trade_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_tech_ind        ON technical_indicators(symbol, calc_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_ai_signals      ON ai_signals(signal_date DESC, signal)",
+    "CREATE INDEX IF NOT EXISTS idx_price_proj      ON price_projections(symbol, projection_date DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_top_movers      ON top_movers(trade_date DESC, category)",
+    "CREATE INDEX IF NOT EXISTS idx_news            ON news(published_at DESC)",
 ]
 
+# SQLite table definitions (kept for local dev)
+SQLITE_TABLES = [
+    (name, sql
+     .replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+     .replace("DOUBLE PRECISION", "REAL")
+     .replace("BIGINT", "INTEGER"))
+    for name, sql in PG_TABLES
+]
+SQLITE_INDEXES = [i.replace(" IF NOT EXISTS ", " IF NOT EXISTS ") for i in PG_INDEXES]
 
-class DatabaseManager:
-    def get_connection(self):
-        if USE_SQLITE:
-            conn = sqlite3.connect(SQLITE_PATH, timeout=30)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            return conn
-        import psycopg2
-        return psycopg2.connect(**DATABASE)
 
-    def initialize_database(self):
-        logger.info("Initializing database…")
-        conn = self.get_connection()
+class DB:
+    def __init__(self):
+        self._pg = USE_POSTGRES
+
+    def conn(self):
+        if self._pg:
+            import psycopg2
+            return psycopg2.connect(DATABASE_URL)
+        else:
+            import sqlite3
+            c = sqlite3.connect(DB_PATH, timeout=30)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA foreign_keys=OFF")
+            return c
+
+    def _rows(self, cur):
+        if self._pg:
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return [dict(r) for r in cur.fetchall()]
+
+    def _row(self, cur):
+        if self._pg:
+            if not cur.description:
+                return None
+            cols = [d[0] for d in cur.description]
+            row  = cur.fetchone()
+            return dict(zip(cols, row)) if row else None
+        r = cur.fetchone()
+        return dict(r) if r else None
+
+    def _sql(self, sql):
+        return _to_pg(sql) if self._pg else sql
+
+    def init(self):
+        tables  = PG_TABLES    if self._pg else SQLITE_TABLES
+        indexes = PG_INDEXES   if self._pg else SQLITE_INDEXES
+        c = self.conn()
         try:
-            cur = conn.cursor()
-            for _, sql in TABLES:
+            cur = c.cursor()
+            for _, sql in tables:
                 cur.execute(sql)
-            for idx in INDEXES:
-                cur.execute(idx)
-            conn.commit()
-            logger.info(f"✅ Database ready — {len(TABLES)} tables")
+            for idx in indexes:
+                try:
+                    cur.execute(idx)
+                except Exception:
+                    pass
+            c.commit()
+            backend = "PostgreSQL/Supabase" if self._pg else f"SQLite ({DB_PATH})"
+            print(f"DB ready — {len(tables)} tables | {backend}")
+        except Exception as e:
+            c.rollback()
+            raise e
         finally:
-            conn.close()
+            c.close()
 
-    def execute(self, sql: str, params=None):
-        conn = self.get_connection()
+    def run(self, sql, params=None):
+        sql = self._sql(sql)
+        c   = self.conn()
         try:
-            cur = conn.cursor()
+            cur = c.cursor()
             cur.execute(sql, params or [])
-            conn.commit()
+            c.commit()
             return cur.rowcount
         except Exception as e:
-            conn.rollback()
-            logger.error(f"DB error: {e} | SQL: {sql[:120]}")
-            raise
+            c.rollback()
+            raise e
         finally:
-            conn.close()
+            c.close()
 
-    def executemany(self, sql: str, data: list):
-        if not data:
+    def runmany(self, sql, params_list):
+        if not params_list:
             return 0
-        conn = self.get_connection()
+        sql = self._sql(sql)
+        c   = self.conn()
         try:
-            cur = conn.cursor()
-            cur.executemany(sql, data)
-            conn.commit()
+            cur = c.cursor()
+            if self._pg:
+                import psycopg2.extras
+                psycopg2.extras.execute_batch(cur, sql, params_list, page_size=200)
+            else:
+                cur.executemany(sql, params_list)
+            c.commit()
             return cur.rowcount
         except Exception as e:
-            conn.rollback()
-            logger.error(f"DB executemany error: {e}")
-            raise
+            c.rollback()
+            raise e
         finally:
-            conn.close()
+            c.close()
 
-    def fetchall(self, sql: str, params=None) -> list:
-        conn = self.get_connection()
+    def one(self, sql, params=None):
+        sql = self._sql(sql)
+        c   = self.conn()
         try:
-            cur = conn.cursor()
+            cur = c.cursor()
             cur.execute(sql, params or [])
-            return [dict(r) for r in cur.fetchall()]
+            return self._row(cur)
         finally:
-            conn.close()
+            c.close()
 
-    def fetchone(self, sql: str, params=None):
-        conn = self.get_connection()
+    def all(self, sql, params=None):
+        sql = self._sql(sql)
+        c   = self.conn()
         try:
-            cur = conn.cursor()
+            cur = c.cursor()
             cur.execute(sql, params or [])
-            r = cur.fetchone()
-            return dict(r) if r else None
+            return self._rows(cur)
         finally:
-            conn.close()
+            c.close()
 
-    def log_scraper_run(self, module, status, records=0, error=None,
-                        started_at=None, finished_at=None, duration=None):
+    def now(self):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def log(self, module, status, records=0, error=None, start_time=None):
+        duration = None
+        if start_time:
+            try:
+                t0 = (datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                      if isinstance(start_time, str) else start_time)
+                duration = round((datetime.now() - t0).total_seconds(), 2)
+            except Exception:
+                pass
         try:
-            self.execute("""
-                INSERT INTO scraper_log
-                  (module, status, records_saved, error_message,
-                   started_at, finished_at, duration_sec, created_at)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, [module, status, records, error, started_at, finished_at,
-                  duration, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+            self.run(
+                """INSERT INTO scraper_log
+                   (module, status, records, error, duration_s, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [module, status, records, error, duration, self.now()])
         except Exception:
             pass
 
 
-db = DatabaseManager()
+db = DB()
+Database = DB
+
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    db.initialize_database()
-    r = db.fetchone("SELECT COUNT(*) as c FROM sqlite_master WHERE type='table'")
-    print(f"✅ {r['c']} tables created in {SQLITE_PATH}")
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    print("Initializing database tables...")
+    db.init()
+    print("Database initialization complete.")
