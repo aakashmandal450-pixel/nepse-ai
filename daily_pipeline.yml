@@ -1,0 +1,85 @@
+name: NEPSE Daily Pipeline
+
+on:
+  schedule:
+    # Runs at 16:15 NPT every Sun–Thu
+    # NPT = UTC+5:45, so 16:15 NPT = 10:30 UTC
+    # cron runs Sun=0, Mon=1, Tue=2, Wed=3, Thu=4
+    - cron: "30 10 * * 0,1,2,3,4"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  run_pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # max allowed for GitHub-hosted runners (6 hours)
+
+    steps:
+      # ── 1. Checkout code ───────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Initialize DB tables (safe — skips if exist) ────
+      - name: Initialize database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python db_manager.py
+
+      # ── 5. Sync stock list ─────────────────────────────────
+      - name: Sync stock list
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --sync-stocks
+
+      # ── 6. Fetch today's live prices + indices ─────────────
+      - name: Fetch live market data
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --live
+
+      # ── 7. Fetch floorsheet + compute broker analysis ──────
+      - name: Fetch floorsheet
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --floorsheet
+
+      # ── 8. Compute technical indicators ───────────────────
+      - name: Compute indicators
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python indicator_engine.py
+
+      # ── 9. Train model (only on Mondays to save time) ──────
+      - name: Train model (weekly)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '30 10 * * 1')
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --train
+
+      # ── 10. Generate signals ───────────────────────────────
+      - name: Generate signals
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --signals
+
+      # ── 11. Update backtest accuracy ───────────────────────
+      - name: Update backtest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --backtest
+
+      # ── 12. Fetch news ─────────────────────────────────────
+      - name: Fetch news
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --news
