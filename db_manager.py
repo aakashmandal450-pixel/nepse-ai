@@ -19,19 +19,59 @@ if not USE_POSTGRES:
         DB_PATH = "nepse_ai.db"
 
 
+# Maps each table to the column(s) covered by its UNIQUE constraint
+# (must match the UNIQUE(...) definitions in PG_TABLES below).
+# Used to build ON CONFLICT (...) DO UPDATE clauses for INSERT OR REPLACE.
+TABLE_UNIQUE_KEYS = {
+    "daily_ohlcv":           ["symbol", "trade_date"],
+    "live_market":           ["symbol", "snapshot_time"],
+    "indices":                ["index_name", "index_date"],
+    "broker_analysis":       ["trade_date", "broker_id"],
+    "broker_concentration":  ["symbol", "trade_date"],
+    "technical_indicators":  ["symbol", "calc_date"],
+    "fundamentals":          ["symbol", "report_date"],
+    "ai_signals":            ["signal_date", "symbol"],
+    "price_projections":     ["symbol", "projection_date", "horizon_days"],
+    "top_movers":            ["trade_date", "symbol", "category"],
+    "news":                  ["news_id"],
+}
+
+
 def _to_pg(sql: str) -> str:
     """Convert SQLite SQL syntax to PostgreSQL."""
     sql = sql.replace("?", "%s")
     sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
     sql = re.sub(r'\bREAL\b', "DOUBLE PRECISION", sql)
+
     # For INSERT OR IGNORE: convert to INSERT ... ON CONFLICT DO NOTHING
-    sql = re.sub(r'INSERT OR IGNORE INTO\s+(\w+)',
-                 lambda m: f'INSERT INTO {m.group(1)}', sql)
     if re.search(r'INSERT OR IGNORE', sql, re.IGNORECASE):
+        sql = re.sub(r'INSERT OR IGNORE INTO\s+(\w+)',
+                     lambda m: f'INSERT INTO {m.group(1)}', sql)
         sql = re.sub(r'INSERT OR IGNORE', 'INSERT', sql, flags=re.IGNORECASE)
         if 'ON CONFLICT' not in sql.upper():
             sql = sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
-    sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql)
+        return sql
+
+    # For INSERT OR REPLACE: convert to a real upsert —
+    # INSERT ... ON CONFLICT (unique_cols) DO UPDATE SET col=EXCLUDED.col, ...
+    # (Previously this just stripped down to a plain INSERT with no conflict
+    # handling at all, which is why duplicate-key errors kept appearing on
+    # every re-run across daily_ohlcv, live_market, indices, broker_analysis,
+    # broker_concentration, and top_movers.)
+    m = re.search(r'INSERT OR REPLACE INTO\s+(\w+)\s*\(([^)]+)\)', sql, re.IGNORECASE)
+    if m:
+        table = m.group(1)
+        cols  = [c.strip() for c in m.group(2).split(",")]
+        sql   = re.sub(r'INSERT OR REPLACE INTO', 'INSERT INTO', sql, flags=re.IGNORECASE)
+        keys  = TABLE_UNIQUE_KEYS.get(table)
+        if keys and 'ON CONFLICT' not in sql.upper():
+            update_cols = [c for c in cols if c not in keys]
+            set_clause  = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
+            sql = sql.rstrip().rstrip(';') + f" ON CONFLICT ({', '.join(keys)}) DO UPDATE SET {set_clause}"
+    else:
+        # Fallback: at least don't error out if the column list pattern doesn't match
+        sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql, flags=re.IGNORECASE)
+
     return sql
 
 

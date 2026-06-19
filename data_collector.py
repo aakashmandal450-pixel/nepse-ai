@@ -484,7 +484,7 @@ def compute_broker_analysis():
                 ?
             FROM floorsheet
             WHERE trade_date = ?
-            GROUP BY buyer_broker
+            GROUP BY trade_date, buyer_broker
         """, (db.now(), today))
 
         # Add sell side
@@ -504,7 +504,7 @@ def compute_broker_analysis():
                 ?
             FROM floorsheet
             WHERE trade_date = ?
-            GROUP BY seller_broker
+            GROUP BY trade_date, seller_broker
         """, (db.now(), today))
 
         # ── broker_concentration: per-symbol scores ───────────
