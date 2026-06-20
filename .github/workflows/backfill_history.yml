@@ -1,0 +1,47 @@
+name: Backfill Price History (Run Once)
+
+on:
+  workflow_dispatch:   # MANUAL TRIGGER ONLY — run this once from GitHub UI
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours — history download takes a while
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Initialize database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python db_manager.py
+
+      - name: Sync stock list
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --sync-stocks
+
+      - name: Download 3 years of price history
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --history
+
+      - name: Compute indicators for all history
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python indicator_engine.py
+
+      - name: Train initial model
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --train
