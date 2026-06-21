@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ML models (too large for GitHub — stored locally or in Supabase bucket)
+models/
+*.pkl
+
+# Local database
+*.db
+*.sqlite
+
+# Streamlit secrets (contains database password — NEVER commit)
+.streamlit/secrets.toml
+
+# Logs and exports
+logs/
+exports/
+
+# Environment files
+.env
+*.env
