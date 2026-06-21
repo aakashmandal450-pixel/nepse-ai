@@ -1,63 +1,61 @@
 """
-=============================================================
-  NEPSE AI TRADER — settings.py
-  All configuration lives here. Edit this file only.
-=============================================================
+NEPSE AI — settings.py
+Edit this file to configure paths and keys.
 """
+import os
 
-# ── DATABASE ──────────────────────────────────────────────────
-DATABASE = {
-    "host":     "localhost",
-    "port":     5432,
-    "name":     "nepse_ai",
-    "user":     "postgres",
-    "password": "your_password_here",   # only used if USE_SQLITE=False
-}
+# ── Paths ─────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+DB_PATH     = os.path.join(BASE_DIR, "nepse_ai.db")
+MODELS_DIR  = os.path.join(BASE_DIR, "models")
+EXPORTS_DIR = os.path.join(BASE_DIR, "exports")
+LOG_DIR     = os.path.join(BASE_DIR, "logs")
 
-USE_SQLITE   = True                     # True = SQLite (no setup needed)
-SQLITE_PATH  = "nepse_ai.db"           # saved right in D:\Stockpile\
+for d in [MODELS_DIR, EXPORTS_DIR, LOG_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-# ── DATA SOURCES ──────────────────────────────────────────────
-NEPSEALPHA_BASE  = "https://nepsealpha.com"
-NEPSE_API_BASE   = "https://nepseapi.surajrimal.dev"
-NEPALSTOCK_API   = "https://www.nepalstock.com.np/api/nots"
-SHARESANSAR_BASE = "https://www.sharesansar.com"
+# ── Data sources ──────────────────────────────────────────────
+NEPSEALPHA_LIVE   = "https://nepsealpha.com/live/stocks"
+NEPALSTOCK_API    = "https://www.nepalstock.com.np/api/nots"
+NEPSE_UNOFF_API   = "https://nepseapi.surajrimal.dev"
+SHARESANSAR_BASE  = "https://www.sharesansar.com"
+MEROLAGANI_BASE   = "https://merolagani.com"
 
-# ── SCRAPING BEHAVIOUR ────────────────────────────────────────
-REQUEST_DELAY_MIN  = 2.0
-REQUEST_DELAY_MAX  = 5.0
-REQUEST_TIMEOUT    = 30
-MAX_RETRIES        = 3
-RETRY_DELAY        = 10
+# ── Scraping ──────────────────────────────────────────────────
+REQUEST_DELAY     = 2.5
+REQUEST_TIMEOUT   = 25
+MAX_RETRIES       = 3
+HISTORY_YEARS     = 3
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0 Safari/537.36",
 ]
 
-# ── NEPSE MARKET CALENDAR ─────────────────────────────────────
-MARKET_OPEN_HOUR  = 11          # 11:00 AM NPT
-MARKET_CLOSE_HOUR = 15          # 3:00 PM  NPT
-# Python weekday: Mon=0 Tue=1 Wed=2 Thu=3 Fri=4 Sat=5 Sun=6
-# NEPSE trades Sun–Thu → 6,0,1,2,3
-MARKET_DAYS = [6, 0, 1, 2, 3]
-
-NEPSE_HOLIDAYS = [
-    "2025-01-11","2025-02-19","2025-03-08","2025-04-14","2025-04-15",
-    "2025-05-01","2025-08-21","2025-09-19","2025-10-02","2025-10-20",
-    "2025-11-05","2025-12-25",
-    "2026-01-11","2026-02-19","2026-04-14","2026-04-15",
+# ── Market calendar ───────────────────────────────────────────
+MARKET_DAYS       = [6, 0, 1, 2, 3]   # Sun=6 Mon=0 Tue=1 Wed=2 Thu=3
+MARKET_OPEN_HOUR  = 11
+MARKET_CLOSE_HOUR = 15
+NEPSE_HOLIDAYS    = [
+    "2025-01-11","2025-02-19","2025-04-14","2025-04-15","2025-05-01",
+    "2025-08-21","2025-09-19","2025-10-02","2025-10-20","2025-11-05",
+    "2026-01-11","2026-02-19","2026-04-14","2026-04-15","2026-05-01",
 ]
 
-# ── SCHEDULER TIMING ─────────────────────────────────────────
-HISTORY_YEARS = 3
+# ── Brokerage costs (for backtesting) ─────────────────────────
+BROKERAGE_PCT    = 0.004   # 0.4% brokerage
+SEBON_PCT        = 0.00015 # 0.015% SEBON fee
+DP_CHARGE        = 25      # Rs. 25 flat DP charge per trade
+TOTAL_COST_PCT   = BROKERAGE_PCT + SEBON_PCT  # ~0.415% one way
 
-# ── LOGGING ───────────────────────────────────────────────────
-LOG_LEVEL        = "INFO"
-LOG_DIR          = "logs"
-LOG_MAX_MB       = 10
-LOG_BACKUP_COUNT = 5
+# ── ML Model ──────────────────────────────────────────────────
+BUY_THRESHOLD    = 0.60    # confidence above this → BUY signal
+SELL_THRESHOLD   = 0.35    # confidence below this → SELL signal
+MIN_CONF_DISPLAY = 50      # hide signals below this confidence
+TARGET_MOVE_PCT  = 0.02    # 2% move = successful signal
+
+# ── Wyckoff phase thresholds ──────────────────────────────────
+WYCKOFF_ACCUM_SCORE  =  15   # broker accum score for "Accumulation"
+WYCKOFF_MARKUP_SCORE =  30   # higher score = "Mark-up"
+WYCKOFF_DIST_SCORE   = -15   # for "Distribution"
+WYCKOFF_DECLINE_SCORE= -30   # for "Decline"
