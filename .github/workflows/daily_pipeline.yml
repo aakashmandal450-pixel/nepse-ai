@@ -1,1 +1,73 @@
+name: NEPSE Daily Pipeline
 
+on:
+  schedule:
+    # Runs at 16:15 NPT every Sun–Thu
+    # NPT = UTC+5:45, so 16:15 NPT = 10:30 UTC
+    # cron runs Sun=0, Mon=1, Tue=2, Wed=3, Thu=4
+    - cron: "30 10 * * 0,1,2,3,4"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  run_pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours — the hard maximum GitHub allows for hosted runners
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Initialize database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python db_manager.py
+
+      - name: Sync stock list
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --sync-stocks
+
+      - name: Fetch live market data
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --live
+
+      - name: Fetch floorsheet
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --floorsheet
+
+      - name: Compute indicators
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python indicator_engine.py
+
+      - name: Train model (weekly)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.event.schedule, '30 10 * * 1')
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --train
+
+      - name: Generate signals
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --signals
+
+      - name: Update backtest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --backtest
+
+      - name: Fetch news
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python data_collector.py --news
