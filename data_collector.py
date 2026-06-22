@@ -484,7 +484,7 @@ def compute_broker_analysis():
                 ?
             FROM floorsheet
             WHERE trade_date = ?
-            GROUP BY trade_date, buyer_broker
+            GROUP BY buyer_broker
         """, (db.now(), today))
 
         # Add sell side
@@ -504,7 +504,7 @@ def compute_broker_analysis():
                 ?
             FROM floorsheet
             WHERE trade_date = ?
-            GROUP BY trade_date, seller_broker
+            GROUP BY seller_broker
         """, (db.now(), today))
 
         # ── broker_concentration: per-symbol scores ───────────
@@ -763,7 +763,16 @@ if __name__ == "__main__":
         collect_indices()
 
     elif "--floorsheet" in sys.argv:
+        # Legacy: fetch floorsheet + run broker analysis in one pass
         collect_floorsheet()
+        compute_broker_analysis()
+
+    elif "--floorsheet-only" in sys.argv:
+        # Intraday workflow: only fetch and store raw floorsheet trades
+        collect_floorsheet()
+
+    elif "--broker-analysis" in sys.argv:
+        # EOD workflow: compute broker concentration from today's stored floorsheet
         compute_broker_analysis()
 
     elif "--history" in sys.argv:
@@ -771,14 +780,23 @@ if __name__ == "__main__":
         collector._build_symbol_id_map()
         collector.run()
 
+    elif "--history-deep" in sys.argv:
+        # Deep historical backfill from Sharesansar (5+ years)
+        from sharesansar_scraper import SharesansarScraper
+        scraper = SharesansarScraper()
+        scraper.run()
+
     elif "--news" in sys.argv:
         collect_news()
         collect_corporate_actions()
 
     else:
         log.info("Usage:")
-        log.info("  python data_collector.py --sync-stocks   Sync stock list from NEPSE")
-        log.info("  python data_collector.py --live           Fetch live prices + indices")
-        log.info("  python data_collector.py --floorsheet     Fetch trades + broker analysis")
-        log.info("  python data_collector.py --history        Fetch 3yr price history")
-        log.info("  python data_collector.py --news           Fetch news + corporate actions")
+        log.info("  python data_collector.py --sync-stocks      Sync stock list from NEPSE")
+        log.info("  python data_collector.py --live              Fetch live prices + indices")
+        log.info("  python data_collector.py --floorsheet        Fetch trades + broker analysis")
+        log.info("  python data_collector.py --floorsheet-only   Fetch raw trades only (intraday)")
+        log.info("  python data_collector.py --broker-analysis   Compute broker scores (EOD)")
+        log.info("  python data_collector.py --history           Fetch ~9mo price history (NEPSE)")
+        log.info("  python data_collector.py --history-deep      Fetch 5yr history (Sharesansar)")
+        log.info("  python data_collector.py --news              Fetch news + corporate actions")

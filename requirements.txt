@@ -24,3 +24,5 @@ streamlit
 
 # Scheduler (local use only)
 schedule
+
+beautifulsoup4
