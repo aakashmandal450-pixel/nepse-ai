@@ -59,9 +59,10 @@ class SharesansarScraper:
 
     def _get_company_id(self, symbol: str) -> str | None:
         """
-        Load the company page and extract the internal Sharesansar company ID
-        needed for the AJAX price history endpoint.
+        Load the company page and extract the internal Sharesansar company ID.
+        Tries multiple extraction strategies since the page structure varies.
         """
+        import re
         url = PRICE_URL.format(symbol=symbol.lower())
         try:
             self._delay()
@@ -69,34 +70,62 @@ class SharesansarScraper:
             if resp.status_code != 200:
                 log.warning(f"{symbol}: company page returned HTTP {resp.status_code}")
                 return None
-            soup = BeautifulSoup(resp.text, "html.parser")
 
-            # The price history tab has a data attribute with the company id
+            html  = resp.text
+            soup  = BeautifulSoup(html, "html.parser")
+
+            # Strategy 1: data-company_id attribute on any tag
             for tag in soup.find_all(attrs={"data-company_id": True}):
-                cid = tag["data-company_id"]
-                log.info(f"{symbol}: found company_id={cid} via data attribute")
-                return cid
-
-            # Fallback: look for it in script tags
-            import re
-            for script in soup.find_all("script"):
-                text = script.string or ""
-                if "company_id" in text:
-                    m = re.search(r'company_id["\s:=]+(\d+)', text)
-                    if m:
-                        cid = m.group(1)
-                        log.info(f"{symbol}: found company_id={cid} via script tag")
-                        return cid
-
-            # Fallback 2: look for it in any tag with data-id near price history
-            for tag in soup.find_all(attrs={"data-id": True}):
-                cid = tag.get("data-id")
-                if cid and cid.isdigit():
-                    log.info(f"{symbol}: found company_id={cid} via data-id attribute")
+                cid = str(tag["data-company_id"]).strip()
+                if cid.isdigit():
+                    log.info(f"{symbol}: company_id={cid} (data-company_id attr)")
                     return cid
 
-            log.warning(f"{symbol}: could not find company_id in page — dumping first 2000 chars")
-            log.warning(resp.text[:2000])
+            # Strategy 2: any script tag containing company_id / cid / companyId
+            patterns = [
+                r'company_id\s*[=:]\s*["\']?(\d+)',
+                r'companyId\s*[=:]\s*["\']?(\d+)',
+                r'"cid"\s*:\s*(\d+)',
+                r"'cid'\s*:\s*(\d+)",
+                r'var\s+cid\s*=\s*(\d+)',
+                r'company\s*=\s*(\d+)',
+            ]
+            for script in soup.find_all("script"):
+                text = script.string or ""
+                for pat in patterns:
+                    m = re.search(pat, text, re.IGNORECASE)
+                    if m:
+                        cid = m.group(1)
+                        log.info(f"{symbol}: company_id={cid} (script pattern: {pat})")
+                        return cid
+
+            # Strategy 3: scan ALL raw HTML with the same patterns
+            for pat in patterns:
+                m = re.search(pat, html, re.IGNORECASE)
+                if m:
+                    cid = m.group(1)
+                    log.info(f"{symbol}: company_id={cid} (raw HTML pattern: {pat})")
+                    return cid
+
+            # Strategy 4: any input[type=hidden] with name containing 'company'
+            for tag in soup.find_all("input", {"type": "hidden"}):
+                name = (tag.get("name") or "").lower()
+                if "company" in name or "cid" in name:
+                    cid = str(tag.get("value", "")).strip()
+                    if cid.isdigit():
+                        log.info(f"{symbol}: company_id={cid} (hidden input: {name})")
+                        return cid
+
+            # Strategy 5: data-id on any element (last resort)
+            for tag in soup.find_all(attrs={"data-id": True}):
+                cid = str(tag.get("data-id", "")).strip()
+                if cid.isdigit():
+                    log.info(f"{symbol}: company_id={cid} (data-id attr)")
+                    return cid
+
+            # Nothing worked — log full HTML so we can see what's there
+            log.warning(f"{symbol}: could not find company_id — dumping full page (first 5000 chars)")
+            log.warning(html[:5000])
             return None
 
         except Exception as e:
