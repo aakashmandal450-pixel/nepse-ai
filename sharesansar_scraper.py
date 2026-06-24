@@ -123,9 +123,10 @@ class SharesansarScraper:
                     log.info(f"{symbol}: company_id={cid} (data-id attr)")
                     return cid
 
-            # Nothing worked — log full HTML so we can see what's there
-            log.warning(f"{symbol}: could not find company_id — dumping full page (first 5000 chars)")
-            log.warning(html[:5000])
+            # Nothing worked — log body sections to find the ID
+            log.warning(f"{symbol}: could not find company_id — total HTML length: {len(html)}")
+            log.warning(f"{symbol}: BODY start (3000-6000):\n{html[3000:6000]}")
+            log.warning(f"{symbol}: BODY mid (6000-10000):\n{html[6000:10000]}")
             return None
 
         except Exception as e:
