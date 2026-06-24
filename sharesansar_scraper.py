@@ -7,11 +7,13 @@ This is a one-time deep backfill tool. After the initial run,
 the daily pipeline handles incremental updates via the NEPSE API.
 
 Usage:
-    python data_collector.py --history-deep
+    python sharesansar_scraper.py --symbol NABIL --start-year 2019
+    python sharesansar_scraper.py --all --start-year 2019
 
 Works by scraping the price history tables at:
     https://www.sharesansar.com/company/{symbol}
 """
+import sys
 import time
 import random
 import logging
@@ -21,6 +23,10 @@ from bs4 import BeautifulSoup
 
 from db_manager import db
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)-18s] %(levelname)s: %(message)s",
+)
 log = logging.getLogger("SharesansarScraper")
 
 BASE_URL    = "https://www.sharesansar.com"
@@ -38,14 +44,15 @@ HEADERS = {
     "Referer": BASE_URL,
 }
 
-# How many candles we already need before skipping a stock
-MIN_CANDLES_TO_SKIP = 600   # ~2.5 years — skip if already well-populated
+# Skip stocks that already have this many candles (skip if well-populated)
+MIN_CANDLES_TO_SKIP = 600   # ~2.5 years
 
 
 class SharesansarScraper:
-    def __init__(self):
-        self.session = requests.Session()
+    def __init__(self, start_year: int = 2019):
+        self.session    = requests.Session()
         self.session.headers.update(HEADERS)
+        self.start_date = f"{start_year}-01-01"
 
     def _delay(self, min_s=1.5, max_s=3.5):
         time.sleep(random.uniform(min_s, max_s))
@@ -60,24 +67,38 @@ class SharesansarScraper:
             self._delay()
             resp = self.session.get(url, timeout=20)
             if resp.status_code != 200:
+                log.warning(f"{symbol}: company page returned HTTP {resp.status_code}")
                 return None
             soup = BeautifulSoup(resp.text, "html.parser")
 
             # The price history tab has a data attribute with the company id
-            # Pattern: data-company_id="123" or similar
             for tag in soup.find_all(attrs={"data-company_id": True}):
-                return tag["data-company_id"]
+                cid = tag["data-company_id"]
+                log.info(f"{symbol}: found company_id={cid} via data attribute")
+                return cid
 
             # Fallback: look for it in script tags
+            import re
             for script in soup.find_all("script"):
                 text = script.string or ""
                 if "company_id" in text:
-                    import re
                     m = re.search(r'company_id["\s:=]+(\d+)', text)
                     if m:
-                        return m.group(1)
+                        cid = m.group(1)
+                        log.info(f"{symbol}: found company_id={cid} via script tag")
+                        return cid
 
+            # Fallback 2: look for it in any tag with data-id near price history
+            for tag in soup.find_all(attrs={"data-id": True}):
+                cid = tag.get("data-id")
+                if cid and cid.isdigit():
+                    log.info(f"{symbol}: found company_id={cid} via data-id attribute")
+                    return cid
+
+            log.warning(f"{symbol}: could not find company_id in page — dumping first 2000 chars")
+            log.warning(resp.text[:2000])
             return None
+
         except Exception as e:
             log.warning(f"{symbol}: failed to get company ID — {e}")
             return None
@@ -96,46 +117,54 @@ class SharesansarScraper:
                 resp = self.session.post(
                     HISTORY_API,
                     data={
-                        "company": company_id,
-                        "start": "2010-01-01",
-                        "end": date.today().strftime("%Y-%m-%d"),
-                        "draw": page,
-                        "length": 500,
+                        "company":     company_id,
+                        "start":       self.start_date,
+                        "end":         date.today().strftime("%Y-%m-%d"),
+                        "draw":        page,
+                        "length":      500,
                         "start_index": (page - 1) * 500,
                     },
                     timeout=20,
                 )
                 if resp.status_code != 200:
+                    log.warning(f"{symbol} page {page}: HTTP {resp.status_code}")
                     break
 
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    log.warning(f"{symbol} page {page}: response is not JSON — "
+                                f"first 500 chars: {resp.text[:500]}")
+                    break
+
                 items = data.get("data", [])
                 if not items:
+                    log.info(f"{symbol}: no items on page {page} — done")
                     break
 
+                log.info(f"{symbol}: page {page} — {len(items)} rows, "
+                         f"sample keys: {list(items[0].keys()) if items else []}")
+
                 for item in items:
-                    # Sharesansar returns date as "2024-01-15" or "15-01-2024"
                     raw_date = (item.get("published_date") or
                                 item.get("date") or
                                 item.get("d") or "")
                     if not raw_date:
                         continue
 
-                    # Normalise date format to YYYY-MM-DD
                     trade_date = _parse_date(raw_date)
                     if not trade_date:
                         continue
 
                     rows.append({
                         "trade_date":  trade_date,
-                        "open_price":  _f(item.get("open") or item.get("o")),
-                        "high_price":  _f(item.get("high") or item.get("h")),
-                        "low_price":   _f(item.get("low")  or item.get("l")),
-                        "close_price": _f(item.get("close")or item.get("c")),
-                        "volume":      _f(item.get("volume")or item.get("v") or 0),
+                        "open_price":  _f(item.get("open")   or item.get("o")),
+                        "high_price":  _f(item.get("high")   or item.get("h")),
+                        "low_price":   _f(item.get("low")    or item.get("l")),
+                        "close_price": _f(item.get("close")  or item.get("c")),
+                        "volume":      _f(item.get("volume") or item.get("v") or 0),
                     })
 
-                # If we got fewer than 500, we've hit the last page
                 if len(items) < 500:
                     break
                 page += 1
@@ -151,11 +180,9 @@ class SharesansarScraper:
         Fetch and store history for one symbol.
         Returns number of new rows inserted.
         """
-        # Check how many candles we already have
+        # Check how many candles we already have — use ? everywhere,
+        # db._sql() will convert to %s for postgres automatically
         existing = db.one(
-            "SELECT COUNT(*) AS cnt FROM daily_ohlcv WHERE symbol=%s",
-            [symbol]
-        ) if db._pg else db.one(
             "SELECT COUNT(*) AS cnt FROM daily_ohlcv WHERE symbol=?",
             [symbol]
         )
@@ -165,9 +192,11 @@ class SharesansarScraper:
             log.info(f"{symbol}: already {count} candles — skipping")
             return 0
 
+        log.info(f"{symbol}: {count} candles currently — fetching from Sharesansar...")
+
         company_id = self._get_company_id(symbol)
         if not company_id:
-            log.warning(f"{symbol}: could not find Sharesansar company ID")
+            log.warning(f"{symbol}: could not find Sharesansar company ID — skipping")
             return 0
 
         rows = self._fetch_history(company_id, symbol)
@@ -195,23 +224,27 @@ class SharesansarScraper:
         ]
 
         if not insert_rows:
+            log.warning(f"{symbol}: parsed 0 valid rows from {len(rows)} raw items")
             return 0
 
+        # Use INSERT ... ON CONFLICT DO NOTHING (db.runmany handles ? -> %s for PG)
         db.runmany("""
-            INSERT OR IGNORE INTO daily_ohlcv
+            INSERT INTO daily_ohlcv
             (symbol, trade_date, open_price, high_price, low_price,
              close_price, adj_close, volume, turnover, total_trades, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (symbol, trade_date) DO NOTHING
         """, insert_rows)
 
-        log.info(f"{symbol}: {len(insert_rows)} candles saved "
-                 f"(was {count}, now up to {count + len(insert_rows)})")
+        log.info(f"{symbol}: inserted {len(insert_rows)} candles "
+                 f"(was {count}, now up to ~{count + len(insert_rows)})")
         return len(insert_rows)
 
     def run(self):
         """Process all active stocks."""
         log.info("=" * 55)
         log.info("  SHARESANSAR DEEP HISTORY BACKFILL")
+        log.info(f"  Start date: {self.start_date}")
         log.info("=" * 55)
 
         stocks = db.all("SELECT symbol FROM stocks WHERE is_active=1")
@@ -271,3 +304,43 @@ def _parse_date(raw: str) -> str | None:
         except ValueError:
             continue
     return None
+
+
+# ── CLI entry point ────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Parse --start-year
+    start_year = 2019
+    for arg in sys.argv:
+        if arg.startswith("--start-year="):
+            start_year = int(arg.split("=")[1])
+        elif arg == "--start-year" and sys.argv.index(arg) + 1 < len(sys.argv):
+            try:
+                start_year = int(sys.argv[sys.argv.index(arg) + 1])
+            except (ValueError, IndexError):
+                pass
+
+    scraper = SharesansarScraper(start_year=start_year)
+
+    if "--symbol" in sys.argv:
+        # Single symbol mode
+        idx = sys.argv.index("--symbol")
+        if idx + 1 < len(sys.argv):
+            symbol = sys.argv[idx + 1].upper()
+            log.info(f"Single symbol mode: {symbol} (from {start_year})")
+            added = scraper.process_symbol(symbol)
+            log.info(f"Done — {added} new candles inserted for {symbol}")
+        else:
+            log.error("--symbol requires a symbol argument, e.g. --symbol NABIL")
+            sys.exit(1)
+
+    elif "--all" in sys.argv:
+        # Full run mode
+        log.info(f"Full run mode — all active stocks from {start_year}")
+        scraper.run()
+
+    else:
+        print("Usage:")
+        print("  python sharesansar_scraper.py --symbol NABIL --start-year 2019")
+        print("  python sharesansar_scraper.py --all --start-year 2019")
+        sys.exit(0)
