@@ -25,9 +25,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("SharesansarScraper")
 
-BASE_URL    = "https://www.sharesansar.com"
-PRICE_URL   = f"{BASE_URL}/company/{{symbol}}"
-HISTORY_API = f"{BASE_URL}/company/history"
+BASE_URL = "https://www.sharesansar.com"
 
 HEADERS = {
     "User-Agent": (
@@ -40,29 +38,25 @@ HEADERS = {
     "Referer": BASE_URL,
 }
 
-# Skip stocks that already have this many candles
 MIN_CANDLES_TO_SKIP = 600   # ~2.5 years
 
 
 class SharesansarScraper:
     def __init__(self, start_year: int = 2019):
-        self.session     = requests.Session()
+        self.session    = requests.Session()
         self.session.headers.update(HEADERS)
-        self.start_date  = f"{start_year}-01-01"
-        self._company_map: dict = {}   # symbol.upper() -> company_id string
+        self.start_date = f"{start_year}-01-01"
+        self._company_map: dict = {}   # symbol.upper() -> cmpjson id
 
     def _delay(self, min_s=1.5, max_s=3.5):
         time.sleep(random.uniform(min_s, max_s))
 
     def _build_company_map(self) -> None:
         """
-        Load the full symbol->id map from the cmpjson variable embedded on any
-        Sharesansar company page. One HTTP request populates ALL symbols.
-
-        The page contains:
-            var cmpjson = [{"id":123,"symbol":"NABIL","companyname":"..."}, ...]
+        Parse var cmpjson from any company page — one request for all symbols.
+        cmpjson format: [{"id":16,"symbol":"NABIL","companyname":"..."}, ...]
         """
-        url = PRICE_URL.format(symbol="nabil")   # any valid symbol works
+        url = f"{BASE_URL}/company/nabil"
         try:
             self._delay()
             resp = self.session.get(url, timeout=20)
@@ -73,7 +67,6 @@ class SharesansarScraper:
             m = re.search(r'var\s+cmpjson\s*=\s*(\[.*?\]);', resp.text, re.DOTALL)
             if not m:
                 log.warning("_build_company_map: cmpjson not found in page")
-                log.warning(f"Page length: {len(resp.text)} chars")
                 return
 
             companies = json.loads(m.group(1))
@@ -89,105 +82,115 @@ class SharesansarScraper:
             log.warning(f"_build_company_map error: {e}")
 
     def _get_company_id(self, symbol: str) -> str | None:
-        """Look up company ID from the pre-built map."""
         if not self._company_map:
             self._build_company_map()
-
         cid = self._company_map.get(symbol.upper())
         if cid:
             log.info(f"{symbol}: company_id={cid}")
             return cid
-
-        log.warning(f"{symbol}: not found in company map "
-                    f"(map has {len(self._company_map)} entries)")
+        log.warning(f"{symbol}: not in company map ({len(self._company_map)} entries)")
         return None
 
     def _fetch_history(self, company_id: str, symbol: str) -> list:
         """
-        Fetch all available price history from the Sharesansar AJAX endpoint.
-        Returns a list of row dicts with date, open, high, low, close, volume.
+        Fetch price history from Sharesansar.
+        Endpoint: GET /company/history
+        Probes two parameter styles on first page, then uses the one that works.
         """
         rows = []
         page = 1
+        working_params = None   # will be set after first successful probe
 
-        # Candidate endpoints — try each until one works
-        endpoints = [
-            ("POST", f"{BASE_URL}/company/history"),
-            ("POST", f"{BASE_URL}/ajax/company_price_history"),
-            ("GET",  f"{BASE_URL}/company/price/history/{company_id}"),
-            ("GET",  f"{BASE_URL}/api/company/price/{company_id}"),
+        # Two parameter styles to try on page 1
+        param_styles = [
+            # Style A: company= (cmpjson numeric id)
+            lambda p: {
+                "company":     company_id,
+                "start":       self.start_date,
+                "end":         date.today().strftime("%Y-%m-%d"),
+                "draw":        p,
+                "length":      500,
+                "start_index": (p - 1) * 500,
+            },
+            # Style B: symbol= (stock ticker)
+            lambda p: {
+                "symbol":      symbol,
+                "start":       self.start_date,
+                "end":         date.today().strftime("%Y-%m-%d"),
+                "draw":        p,
+                "length":      500,
+                "start_index": (p - 1) * 500,
+            },
+            # Style C: id= with symbol
+            lambda p: {
+                "id":          company_id,
+                "symbol":      symbol,
+                "start":       self.start_date,
+                "end":         date.today().strftime("%Y-%m-%d"),
+                "draw":        p,
+                "length":      500,
+                "start_index": (p - 1) * 500,
+            },
         ]
-        working_endpoint = None
+
+        url = f"{BASE_URL}/company/history"
 
         while True:
             try:
                 self._delay(0.8, 2.0)
-                params = {
-                    "company":     company_id,
-                    "start":       self.start_date,
-                    "end":         date.today().strftime("%Y-%m-%d"),
-                    "draw":        page,
-                    "length":      500,
-                    "start_index": (page - 1) * 500,
-                }
 
-                # On first page, probe endpoints until we get a 200
-                if page == 1 and working_endpoint is None:
-                    for method, url in endpoints:
-                        try:
-                            if method == "POST":
-                                r = self.session.post(url, data=params, timeout=20)
-                            else:
-                                r = self.session.get(url, params=params, timeout=20)
-                            log.info(f"{symbol}: probing {method} {url} -> {r.status_code}")
-                            if r.status_code == 200:
-                                working_endpoint = (method, url)
-                                resp = r
-                                break
-                            else:
-                                log.warning(f"{symbol}: {url} returned {r.status_code} — {r.text[:200]}")
-                        except Exception as e:
-                            log.warning(f"{symbol}: {url} error: {e}")
-                    if working_endpoint is None:
-                        log.warning(f"{symbol}: all endpoints failed")
+                if page == 1 and working_params is None:
+                    # Probe each style
+                    for style_fn in param_styles:
+                        params = style_fn(1)
+                        r = self.session.get(url, params=params, timeout=20)
+                        log.info(f"{symbol}: probing style {list(params.keys())[:2]} "
+                                 f"-> HTTP {r.status_code}")
+                        if r.status_code == 200:
+                            try:
+                                data = r.json()
+                                items = data.get("data", [])
+                                log.info(f"{symbol}: got {len(items)} items, "
+                                         f"keys={list(items[0].keys()) if items else '[]'}")
+                                if items is not None:   # even empty list is OK
+                                    working_params = style_fn
+                                    resp = r
+                                    break
+                            except Exception as e:
+                                log.warning(f"{symbol}: JSON parse failed: {e} — "
+                                            f"body: {r.text[:300]}")
+                        else:
+                            log.warning(f"{symbol}: {r.status_code} — {r.text[:200]}")
+
+                    if working_params is None:
+                        log.warning(f"{symbol}: all parameter styles failed")
                         break
                 else:
-                    method, url = working_endpoint
-                    if method == "POST":
-                        resp = self.session.post(url, data=params, timeout=20)
-                    else:
-                        resp = self.session.get(url, params=params, timeout=20)
-
-                if resp.status_code != 200:
-                    log.warning(f"{symbol} page {page}: HTTP {resp.status_code}")
-                    break
+                    params = working_params(page)
+                    resp = self.session.get(url, params=params, timeout=20)
+                    if resp.status_code != 200:
+                        log.warning(f"{symbol} page {page}: HTTP {resp.status_code}")
+                        break
 
                 try:
                     data = resp.json()
                 except Exception:
-                    log.warning(f"{symbol} page {page}: not JSON — "
-                                f"first 300 chars: {resp.text[:300]}")
+                    log.warning(f"{symbol} page {page}: not JSON — {resp.text[:300]}")
                     break
 
                 items = data.get("data", [])
                 if not items:
-                    log.info(f"{symbol}: no items on page {page} — done")
+                    log.info(f"{symbol}: no items on page {page} — done ({len(rows)} total)")
                     break
-
-                log.info(f"{symbol}: page {page} — {len(items)} rows, "
-                         f"sample keys: {list(items[0].keys()) if items else []}")
 
                 for item in items:
                     raw_date = (item.get("published_date") or
-                                item.get("date") or
-                                item.get("d") or "")
+                                item.get("date") or item.get("d") or "")
                     if not raw_date:
                         continue
-
                     trade_date = _parse_date(raw_date)
                     if not trade_date:
                         continue
-
                     rows.append({
                         "trade_date":  trade_date,
                         "open_price":  _f(item.get("open")   or item.get("o")),
@@ -208,18 +211,15 @@ class SharesansarScraper:
         return rows
 
     def process_symbol(self, symbol: str) -> int:
-        """Fetch and store history for one symbol. Returns rows inserted."""
         existing = db.one(
-            "SELECT COUNT(*) AS cnt FROM daily_ohlcv WHERE symbol=?",
-            [symbol]
-        )
+            "SELECT COUNT(*) AS cnt FROM daily_ohlcv WHERE symbol=?", [symbol])
         count = existing.get("cnt", 0) if existing else 0
 
         if count >= MIN_CANDLES_TO_SKIP:
             log.info(f"{symbol}: already {count} candles — skipping")
             return 0
 
-        log.info(f"{symbol}: {count} candles currently — fetching from Sharesansar...")
+        log.info(f"{symbol}: {count} candles — fetching from Sharesansar...")
 
         company_id = self._get_company_id(symbol)
         if not company_id:
@@ -227,30 +227,19 @@ class SharesansarScraper:
 
         rows = self._fetch_history(company_id, symbol)
         if not rows:
-            log.warning(f"{symbol}: no data returned from Sharesansar")
+            log.warning(f"{symbol}: no data returned")
             return 0
 
         now = db.now()
         insert_rows = [
-            (
-                symbol,
-                r["trade_date"],
-                r["open_price"],
-                r["high_price"],
-                r["low_price"],
-                r["close_price"],
-                r["close_price"],   # adj_close
-                r["volume"],
-                None,               # turnover
-                None,               # total_trades
-                now,
-            )
-            for r in rows
-            if r["close_price"] and r["trade_date"]
+            (symbol, r["trade_date"], r["open_price"], r["high_price"],
+             r["low_price"], r["close_price"], r["close_price"],
+             r["volume"], None, None, now)
+            for r in rows if r["close_price"] and r["trade_date"]
         ]
 
         if not insert_rows:
-            log.warning(f"{symbol}: parsed 0 valid rows from {len(rows)} raw items")
+            log.warning(f"{symbol}: 0 valid rows from {len(rows)} raw items")
             return 0
 
         db.runmany("""
@@ -261,18 +250,15 @@ class SharesansarScraper:
             ON CONFLICT (symbol, trade_date) DO NOTHING
         """, insert_rows)
 
-        log.info(f"{symbol}: inserted {len(insert_rows)} candles "
-                 f"(was {count}, now ~{count + len(insert_rows)})")
+        log.info(f"{symbol}: inserted {len(insert_rows)} candles")
         return len(insert_rows)
 
     def run(self) -> None:
-        """Process all active stocks."""
         log.info("=" * 55)
         log.info("  SHARESANSAR DEEP HISTORY BACKFILL")
         log.info(f"  Start date: {self.start_date}")
         log.info("=" * 55)
 
-        # Build the map once before the loop
         self._build_company_map()
         if not self._company_map:
             log.error("Could not build company map — aborting")
@@ -284,9 +270,7 @@ class SharesansarScraper:
             return
 
         log.info(f"Processing {len(stocks)} symbols...")
-        total_new = 0
-        skipped   = 0
-        failed    = 0
+        total_new = skipped = failed = 0
 
         for i, row in enumerate(stocks, 1):
             sym = row["symbol"]
@@ -296,26 +280,19 @@ class SharesansarScraper:
                     skipped += 1
                 else:
                     total_new += added
-
                 if i % 20 == 0:
                     log.info(f"  Progress: {i}/{len(stocks)} | "
-                             f"New candles: {total_new:,} | "
-                             f"Skipped: {skipped} | Failed: {failed}")
+                             f"New: {total_new:,} | Skipped: {skipped} | Failed: {failed}")
                     time.sleep(3)
-
             except Exception as e:
                 log.error(f"{sym}: crashed — {e}")
                 failed += 1
-                continue
 
         log.info(f"\nComplete — {total_new:,} new candles | "
                  f"{skipped} skipped | {failed} failed")
 
 
-# ── helpers ────────────────────────────────────────────────────
-
 def _f(val):
-    """Safe float conversion, returns None on failure."""
     try:
         return float(str(val).replace(",", "")) if val is not None else None
     except (ValueError, TypeError):
@@ -323,7 +300,6 @@ def _f(val):
 
 
 def _parse_date(raw: str):
-    """Parse a date string into YYYY-MM-DD format."""
     raw = str(raw).strip()
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d",
                 "%B %d, %Y", "%d %b %Y"):
@@ -334,10 +310,7 @@ def _parse_date(raw: str):
     return None
 
 
-# ── CLI entry point ────────────────────────────────────────────
-
 if __name__ == "__main__":
-    # Parse --start-year
     start_year = 2019
     for i, arg in enumerate(sys.argv):
         if arg.startswith("--start-year="):
@@ -358,7 +331,7 @@ if __name__ == "__main__":
             added = scraper.process_symbol(symbol)
             log.info(f"Done — {added} new candles inserted for {symbol}")
         else:
-            log.error("--symbol requires a symbol argument, e.g. --symbol NABIL")
+            log.error("--symbol requires an argument, e.g. --symbol NABIL")
             sys.exit(1)
 
     elif "--all" in sys.argv:
