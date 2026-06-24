@@ -27,7 +27,7 @@ log = logging.getLogger("SharesansarScraper")
 
 BASE_URL    = "https://www.sharesansar.com"
 PRICE_URL   = f"{BASE_URL}/company/{{symbol}}"
-HISTORY_API = f"{BASE_URL}/ajax/company_price_history"
+HISTORY_API = f"{BASE_URL}/company/history"
 
 HEADERS = {
     "User-Agent": (
@@ -110,21 +110,54 @@ class SharesansarScraper:
         rows = []
         page = 1
 
+        # Candidate endpoints — try each until one works
+        endpoints = [
+            ("POST", f"{BASE_URL}/company/history"),
+            ("POST", f"{BASE_URL}/ajax/company_price_history"),
+            ("GET",  f"{BASE_URL}/company/price/history/{company_id}"),
+            ("GET",  f"{BASE_URL}/api/company/price/{company_id}"),
+        ]
+        working_endpoint = None
+
         while True:
             try:
                 self._delay(0.8, 2.0)
-                resp = self.session.post(
-                    HISTORY_API,
-                    data={
-                        "company":     company_id,
-                        "start":       self.start_date,
-                        "end":         date.today().strftime("%Y-%m-%d"),
-                        "draw":        page,
-                        "length":      500,
-                        "start_index": (page - 1) * 500,
-                    },
-                    timeout=20,
-                )
+                params = {
+                    "company":     company_id,
+                    "start":       self.start_date,
+                    "end":         date.today().strftime("%Y-%m-%d"),
+                    "draw":        page,
+                    "length":      500,
+                    "start_index": (page - 1) * 500,
+                }
+
+                # On first page, probe endpoints until we get a 200
+                if page == 1 and working_endpoint is None:
+                    for method, url in endpoints:
+                        try:
+                            if method == "POST":
+                                r = self.session.post(url, data=params, timeout=20)
+                            else:
+                                r = self.session.get(url, params=params, timeout=20)
+                            log.info(f"{symbol}: probing {method} {url} -> {r.status_code}")
+                            if r.status_code == 200:
+                                working_endpoint = (method, url)
+                                resp = r
+                                break
+                            else:
+                                log.warning(f"{symbol}: {url} returned {r.status_code} — {r.text[:200]}")
+                        except Exception as e:
+                            log.warning(f"{symbol}: {url} error: {e}")
+                    if working_endpoint is None:
+                        log.warning(f"{symbol}: all endpoints failed")
+                        break
+                else:
+                    method, url = working_endpoint
+                    if method == "POST":
+                        resp = self.session.post(url, data=params, timeout=20)
+                    else:
+                        resp = self.session.get(url, params=params, timeout=20)
+
                 if resp.status_code != 200:
                     log.warning(f"{symbol} page {page}: HTTP {resp.status_code}")
                     break
