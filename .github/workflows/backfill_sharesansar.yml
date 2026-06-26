@@ -44,7 +44,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python data_collector.py --sync-stocks
 
-      - name: Run Sharesansar backfill
+      - name: Run MeroLagani backfill
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           START_YEAR:   ${{ github.event.inputs.start_year || '2019' }}
@@ -53,10 +53,10 @@ jobs:
           LIMIT="${{ github.event.inputs.limit || '0' }}"
           if [ -n "$SYMBOL" ]; then
             echo "Testing single symbol: $SYMBOL"
-            python sharesansar_scraper.py --symbol "$SYMBOL" --start-year "$START_YEAR"
+            python merolagani_scraper.py --symbol "$SYMBOL" --start-year "$START_YEAR"
           else
             echo "Full backfill (limit=$LIMIT)"
-            python sharesansar_scraper.py --start-year "$START_YEAR" --limit "$LIMIT"
+            python merolagani_scraper.py --start-year "$START_YEAR" --limit "$LIMIT"
           fi
 
       - name: Report results
