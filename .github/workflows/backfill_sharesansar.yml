@@ -1,95 +1,65 @@
-name: Backfill Deep History (Sharesansar — Run Once)
+name: Sharesansar Historical Backfill
 
 on:
-  workflow_dispatch:   # MANUAL TRIGGER ONLY — never run automatically
+  workflow_dispatch:
     inputs:
-      symbol:
-        description: 'Single symbol to test (leave blank to run all)'
-        required: false
-        default: ''
       start_year:
-        description: 'Earliest year to fetch (default: 2019)'
+        description: "Start year for backfill (e.g. 2019)"
         required: false
-        default: '2019'
+        default: "2019"
+      symbol:
+        description: "Single symbol to test (leave blank for all)"
+        required: false
+        default: ""
+      limit:
+        description: "Max symbols to process (0 = all)"
+        required: false
+        default: "0"
 
 jobs:
   backfill_deep:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours — full 637-stock scrape takes a while
+    timeout-minutes: 360
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python ──────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # ── 3. Dependencies ────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Initialize DB ───────────────────────────────────
       - name: Initialize database
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python db_manager.py
 
-      # ── 5. Sync stock list (needed for symbol loop) ────────
       - name: Sync stock list
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python data_collector.py --sync-stocks
 
-      # ── 6. Single-symbol test run ──────────────────────────
-      #    If 'symbol' input is provided, only scrape that one stock.
-      #    Use this first to verify the scraper works before full run.
-      - name: Deep history scrape (single symbol test)
-        if: ${{ github.event.inputs.symbol != '' }}
+      - name: Run Sharesansar backfill
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          START_YEAR:   ${{ github.event.inputs.start_year }}
+          START_YEAR:   ${{ github.event.inputs.start_year || '2019' }}
         run: |
-          echo "Testing single symbol: ${{ github.event.inputs.symbol }}"
-          python sharesansar_scraper.py --symbol "${{ github.event.inputs.symbol }}" --start-year "$START_YEAR"
+          SYMBOL="${{ github.event.inputs.symbol }}"
+          LIMIT="${{ github.event.inputs.limit || '0' }}"
+          if [ -n "$SYMBOL" ]; then
+            echo "Testing single symbol: $SYMBOL"
+            python sharesansar_scraper.py --symbol "$SYMBOL" --start-year "$START_YEAR"
+          else
+            echo "Full backfill (limit=$LIMIT)"
+            python sharesansar_scraper.py --start-year "$START_YEAR" --limit "$LIMIT"
+          fi
 
-      # ── 7. Full run (all symbols) ──────────────────────────
-      #    Only runs when no symbol is specified.
-      - name: Deep history scrape (all symbols)
-        if: ${{ github.event.inputs.symbol == '' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          START_YEAR:   ${{ github.event.inputs.start_year }}
-        run: |
-          echo "Starting full deep history backfill from $START_YEAR..."
-          python sharesansar_scraper.py --all --start-year "$START_YEAR"
-
-      # ── 8. Recompute indicators on new data ────────────────
-      #    Only runs after a full scrape (not single-symbol test)
-      - name: Recompute technical indicators
-        if: ${{ github.event.inputs.symbol == '' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          echo "Recomputing indicators on expanded dataset..."
-          python indicator_engine.py
-
-      # ── 9. Retrain model on expanded dataset ───────────────
-      #    Only runs after a full scrape
-      - name: Retrain model on full dataset
-        if: ${{ github.event.inputs.symbol == '' }}
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          echo "Retraining model with 5+ years of data..."
-          python ai_signal_engine.py --train
-
-      # ── 10. Summary ────────────────────────────────────────
-      - name: Print row count summary
+      - name: Report results
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
