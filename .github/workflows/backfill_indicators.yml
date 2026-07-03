@@ -1,0 +1,32 @@
+name: Backfill Technical Indicators + Retrain (Run Once)
+
+on:
+  workflow_dispatch:   # MANUAL TRIGGER ONLY — run from GitHub Actions UI
+
+jobs:
+  backfill_indicators:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # indicator backfill across 6yrs x ~300 symbols takes a while
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill technical_indicators across full history
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python indicator_engine.py --backfill
+
+      - name: Retrain model on full 6-year history
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ai_signal_engine.py --train --lookback=2190
