@@ -237,7 +237,8 @@ class DB:
                 self._pg_conn = None
 
         self._pg_conn = psycopg2.connect(
-            DATABASE_URL, sslmode="require", connect_timeout=15
+            DATABASE_URL, sslmode="require", connect_timeout=15,
+            client_encoding="utf8"
         )
         return self._pg_conn
 
