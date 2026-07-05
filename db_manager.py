@@ -19,59 +19,19 @@ if not USE_POSTGRES:
         DB_PATH = "nepse_ai.db"
 
 
-# Maps each table to the column(s) covered by its UNIQUE constraint
-# (must match the UNIQUE(...) definitions in PG_TABLES below).
-# Used to build ON CONFLICT (...) DO UPDATE clauses for INSERT OR REPLACE.
-TABLE_UNIQUE_KEYS = {
-    "daily_ohlcv":           ["symbol", "trade_date"],
-    "live_market":           ["symbol", "snapshot_time"],
-    "indices":                ["index_name", "index_date"],
-    "broker_analysis":       ["trade_date", "broker_id"],
-    "broker_concentration":  ["symbol", "trade_date"],
-    "technical_indicators":  ["symbol", "calc_date"],
-    "fundamentals":          ["symbol", "report_date"],
-    "ai_signals":            ["signal_date", "symbol"],
-    "price_projections":     ["symbol", "projection_date", "horizon_days"],
-    "top_movers":            ["trade_date", "symbol", "category"],
-    "news":                  ["news_id"],
-}
-
-
 def _to_pg(sql: str) -> str:
     """Convert SQLite SQL syntax to PostgreSQL."""
     sql = sql.replace("?", "%s")
     sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
     sql = re.sub(r'\bREAL\b', "DOUBLE PRECISION", sql)
-
     # For INSERT OR IGNORE: convert to INSERT ... ON CONFLICT DO NOTHING
+    sql = re.sub(r'INSERT OR IGNORE INTO\s+(\w+)',
+                 lambda m: f'INSERT INTO {m.group(1)}', sql)
     if re.search(r'INSERT OR IGNORE', sql, re.IGNORECASE):
-        sql = re.sub(r'INSERT OR IGNORE INTO\s+(\w+)',
-                     lambda m: f'INSERT INTO {m.group(1)}', sql)
         sql = re.sub(r'INSERT OR IGNORE', 'INSERT', sql, flags=re.IGNORECASE)
         if 'ON CONFLICT' not in sql.upper():
             sql = sql.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING'
-        return sql
-
-    # For INSERT OR REPLACE: convert to a real upsert —
-    # INSERT ... ON CONFLICT (unique_cols) DO UPDATE SET col=EXCLUDED.col, ...
-    # (Previously this just stripped down to a plain INSERT with no conflict
-    # handling at all, which is why duplicate-key errors kept appearing on
-    # every re-run across daily_ohlcv, live_market, indices, broker_analysis,
-    # broker_concentration, and top_movers.)
-    m = re.search(r'INSERT OR REPLACE INTO\s+(\w+)\s*\(([^)]+)\)', sql, re.IGNORECASE)
-    if m:
-        table = m.group(1)
-        cols  = [c.strip() for c in m.group(2).split(",")]
-        sql   = re.sub(r'INSERT OR REPLACE INTO', 'INSERT INTO', sql, flags=re.IGNORECASE)
-        keys  = TABLE_UNIQUE_KEYS.get(table)
-        if keys and 'ON CONFLICT' not in sql.upper():
-            update_cols = [c for c in cols if c not in keys]
-            set_clause  = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
-            sql = sql.rstrip().rstrip(';') + f" ON CONFLICT ({', '.join(keys)}) DO UPDATE SET {set_clause}"
-    else:
-        # Fallback: at least don't error out if the column list pattern doesn't match
-        sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql, flags=re.IGNORECASE)
-
+    sql = re.sub(r'INSERT OR REPLACE INTO', "INSERT INTO", sql)
     return sql
 
 
@@ -239,11 +199,11 @@ SQLITE_INDEXES = [i.replace(" IF NOT EXISTS ", " IF NOT EXISTS ") for i in PG_IN
 class DB:
     def __init__(self):
         self._pg = USE_POSTGRES
+        self._pg_conn = None   # persistent connection, reused across calls
 
     def conn(self):
         if self._pg:
-            import psycopg2
-            return psycopg2.connect(DATABASE_URL, sslmode="require")
+            return self._pg_connect()
         else:
             import sqlite3
             c = sqlite3.connect(DB_PATH, timeout=30)
@@ -251,6 +211,35 @@ class DB:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA foreign_keys=OFF")
             return c
+
+    def _pg_connect(self):
+        """Reuse one persistent connection instead of opening a new TCP+TLS
+        connection for every single query. Reconnects if the cached
+        connection has died. connect_timeout prevents an indefinite hang if
+        the network path to Supabase is slow/unreachable — without it,
+        psycopg2 can block for a very long time with no error at all."""
+        import psycopg2
+        if self._pg_conn is not None:
+            try:
+                if self._pg_conn.closed:
+                    self._pg_conn = None
+                else:
+                    # cheap liveness check
+                    cur = self._pg_conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+                    return self._pg_conn
+            except Exception:
+                try:
+                    self._pg_conn.close()
+                except Exception:
+                    pass
+                self._pg_conn = None
+
+        self._pg_conn = psycopg2.connect(
+            DATABASE_URL, sslmode="require", connect_timeout=15
+        )
+        return self._pg_conn
 
     def _rows(self, cur):
         if self._pg:
@@ -291,7 +280,8 @@ class DB:
             c.rollback()
             raise e
         finally:
-            c.close()
+            if not self._pg:
+                c.close()
 
     def run(self, sql, params=None):
         sql = self._sql(sql)
@@ -305,7 +295,8 @@ class DB:
             c.rollback()
             raise e
         finally:
-            c.close()
+            if not self._pg:
+                c.close()
 
     def runmany(self, sql, params_list):
         if not params_list:
@@ -325,7 +316,8 @@ class DB:
             c.rollback()
             raise e
         finally:
-            c.close()
+            if not self._pg:
+                c.close()
 
     def one(self, sql, params=None):
         sql = self._sql(sql)
@@ -335,7 +327,8 @@ class DB:
             cur.execute(sql, params or [])
             return self._row(cur)
         finally:
-            c.close()
+            if not self._pg:
+                c.close()
 
     def all(self, sql, params=None):
         sql = self._sql(sql)
@@ -345,7 +338,8 @@ class DB:
             cur.execute(sql, params or [])
             return self._rows(cur)
         finally:
-            c.close()
+            if not self._pg:
+                c.close()
 
     def now(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
