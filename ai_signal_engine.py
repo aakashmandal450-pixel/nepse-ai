@@ -544,9 +544,13 @@ class NEPSEModel:
         import pandas as pd
 
         signal_date = signal_date or date.today().strftime("%Y-%m-%d")
-        target_date = self._next_trading_day(signal_date)
+        # target_date is the evaluation horizon for this signal. The system's
+        # framing (target_10d, ATR-based stop_loss/risk_reward, price
+        # projections) is all built around a ~10-trading-day swing horizon,
+        # so target_date must be 10 trading days forward, not 1.
+        target_date = self._nth_trading_day(signal_date, 10)
 
-        logger.info(f"Generating signals for {target_date} (predicted from {signal_date})...")
+        logger.info(f"Generating signals for {target_date} (10-trading-day horizon from {signal_date})...")
         start  = db.now()
 
         cutoff = (date.fromisoformat(signal_date) - timedelta(days=365)).strftime("%Y-%m-%d")
@@ -793,9 +797,14 @@ class NEPSEModel:
             logger.warning(f"Export error: {e}")
 
     # ── BACKTESTING ───────────────────────────────────────────
-    def backtest(self, start_date=None, end_date=None):
-        end_date   = end_date   or date.today().strftime("%Y-%m-%d")
-        start_date = start_date or (date.today()-timedelta(days=90)).strftime("%Y-%m-%d")
+    def backtest(self, start_date=None, end_date=None, full=False):
+        end_date = end_date or date.today().strftime("%Y-%m-%d")
+        if full and not start_date:
+            earliest = db.one("SELECT MIN(signal_date) AS d FROM ai_signals")
+            start_date = (earliest.get("d") if earliest else None) or \
+                         (date.today()-timedelta(days=90)).strftime("%Y-%m-%d")
+        else:
+            start_date = start_date or (date.today()-timedelta(days=90)).strftime("%Y-%m-%d")
         logger.info(f"Backtesting {start_date} → {end_date}...")
 
         pending = db.all("""
@@ -807,15 +816,21 @@ class NEPSEModel:
 
         updated = 0
         for sig in pending:
+            # Exit price: close on (or nearest before) target_date
             actual = db.one("""
                 SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? AND trade_date=?
+                WHERE symbol=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1
             """, [sig["symbol"], sig["target_date"]])
 
+            # Entry price: close on (or nearest before) signal_date — this is
+            # the actual basis the signal/ltp was generated from. Previously
+            # this incorrectly looked up the day just before target_date,
+            # which measured a 1-day return at the horizon instead of the
+            # full holding-period return from signal_date to target_date.
             prev = db.one("""
                 SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1
-            """, [sig["symbol"], sig["target_date"]])
+                WHERE symbol=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1
+            """, [sig["symbol"], sig["signal_date"]])
 
             if not actual or not prev or not prev.get("close_price"):
                 continue
@@ -836,13 +851,13 @@ class NEPSEModel:
         # Print summary
         stats = db.one("""
             SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN signal='BUY'  THEN 1 ELSE 0 END) AS buys,
-                   SUM(CASE WHEN signal='SELL' THEN 1 ELSE 0 END) AS sells,
-                   ROUND(CAST(AVG(signal_correct) AS NUMERIC)*100,1) AS accuracy,
-                   ROUND(CAST(AVG(CASE WHEN signal='BUY'  THEN signal_correct END) AS NUMERIC)*100,1) AS buy_acc,
-                   ROUND(CAST(AVG(CASE WHEN signal='SELL' THEN signal_correct END) AS NUMERIC)*100,1) AS sell_acc,
-                   ROUND(CAST(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_win,
-                   ROUND(CAST(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_loss
+                   SUM(signal='BUY')  AS buys,
+                   SUM(signal='SELL') AS sells,
+                   ROUND(AVG(signal_correct)*100,1) AS accuracy,
+                   ROUND(AVG(CASE WHEN signal='BUY'  THEN signal_correct END)*100,1) AS buy_acc,
+                   ROUND(AVG(CASE WHEN signal='SELL' THEN signal_correct END)*100,1) AS sell_acc,
+                   ROUND(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END),2) AS avg_win,
+                   ROUND(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END),2) AS avg_loss
             FROM ai_signals WHERE signal_correct IS NOT NULL
         """)
 
@@ -891,6 +906,58 @@ class NEPSEModel:
             d += timedelta(days=1)
         return d.strftime("%Y-%m-%d")
 
+    def _nth_trading_day(self, from_date, n=10):
+        """Return the date that is the Nth NEPSE trading day after from_date."""
+        d = date.fromisoformat(from_date)
+        count = 0
+        safety = 0
+        while count < n and safety < (n * 4 + 30):
+            d += timedelta(days=1)
+            safety += 1
+            if d.weekday() in MARKET_DAYS and d.strftime("%Y-%m-%d") not in NEPSE_HOLIDAYS:
+                count += 1
+        return d.strftime("%Y-%m-%d")
+
+    def fix_target_dates(self):
+        """
+        ONE-TIME MIGRATION.
+        Existing ai_signals rows have target_date set to the very next
+        trading day (a bug), even though target_10d / stop_loss /
+        risk_reward are all framed around a 10-trading-day swing horizon.
+        This recomputes target_date correctly and clears the evaluation
+        fields (actual_close_10d, actual_pct_10d, signal_correct) so that
+        backtest() re-scores every signal against the right horizon
+        instead of the accidental 1-day one.
+        Run once, then re-run: python ai_signal_engine.py --backtest --full
+        """
+        logger.info("=" * 55)
+        logger.info("  FIXING target_date (1-day bug -> 10-trading-day horizon)")
+        logger.info("=" * 55)
+
+        rows = db.all("""
+            SELECT id, symbol, signal_date, target_date
+            FROM ai_signals
+            WHERE signal IN ('BUY','SELL')
+        """)
+        logger.info(f"Found {len(rows)} BUY/SELL signals to inspect")
+
+        updated = 0
+        for r in rows:
+            correct_target = self._nth_trading_day(r["signal_date"], 10)
+            if correct_target != r["target_date"]:
+                db.run("""
+                    UPDATE ai_signals SET
+                        target_date=?,
+                        actual_close_10d=NULL,
+                        actual_pct_10d=NULL,
+                        signal_correct=NULL
+                    WHERE id=?
+                """, [correct_target, r["id"]])
+                updated += 1
+
+        logger.info(f"Re-dated {updated} signals ({len(rows) - updated} were already correct)")
+        logger.info("Next step: python ai_signal_engine.py --backtest --full")
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
@@ -899,7 +966,14 @@ if __name__ == "__main__":
     model = NEPSEModel()
 
     if "--train" in sys.argv:
-        model.train()
+        lookback = 730
+        for a in sys.argv:
+            if a.startswith("--lookback="):
+                try:
+                    lookback = int(a.split("=", 1)[1])
+                except ValueError:
+                    logger.warning(f"Invalid --lookback value '{a}', using default {lookback}")
+        model.train(lookback_days=lookback)
 
     elif "--signals" in sys.argv:
         date_arg = None
@@ -916,11 +990,17 @@ if __name__ == "__main__":
                   f"Rs.{s['ltp']:7,.0f} Rs.{s['target_10d']:8,.0f} "
                   f"Rs.{s['stop_loss']:7,.0f} {s['strategy']:20} {s['wyckoff_phase']:15}")
 
+    elif "--fix-target-dates" in sys.argv:
+        model.fix_target_dates()
+
     elif "--backtest" in sys.argv:
-        model.backtest()
+        model.backtest(full="--full" in sys.argv)
 
     else:
         print("Usage:")
         print("  python ai_signal_engine.py --train")
+        print("  python ai_signal_engine.py --train --lookback=2190")
         print("  python ai_signal_engine.py --signals")
+        print("  python ai_signal_engine.py --fix-target-dates   (one-time migration)")
         print("  python ai_signal_engine.py --backtest")
+        print("  python ai_signal_engine.py --backtest --full    (re-score all signals after migration)")

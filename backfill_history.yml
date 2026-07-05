@@ -36,10 +36,10 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python data_collector.py --history
 
-      - name: Backfill indicators for all history
+      - name: Compute indicators for all history
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python indicator_engine.py --backfill
+        run: python indicator_engine.py
 
       - name: Train initial model
         env:
