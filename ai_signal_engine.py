@@ -836,13 +836,13 @@ class NEPSEModel:
         # Print summary
         stats = db.one("""
             SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN signal='BUY'  THEN 1 ELSE 0 END) AS buys,
-                   SUM(CASE WHEN signal='SELL' THEN 1 ELSE 0 END) AS sells,
-                   ROUND(AVG(signal_correct)*100,1) AS accuracy,
-                   ROUND(AVG(CASE WHEN signal='BUY'  THEN signal_correct END)*100,1) AS buy_acc,
-                   ROUND(AVG(CASE WHEN signal='SELL' THEN signal_correct END)*100,1) AS sell_acc,
-                   ROUND(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END),2) AS avg_win,
-                   ROUND(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END),2) AS avg_loss
+                   SUM(signal='BUY')  AS buys,
+                   SUM(signal='SELL') AS sells,
+                   ROUND(CAST(AVG(signal_correct) AS NUMERIC)*100,1) AS accuracy,
+                   ROUND(CAST(AVG(CASE WHEN signal='BUY'  THEN signal_correct END) AS NUMERIC)*100,1) AS buy_acc,
+                   ROUND(CAST(AVG(CASE WHEN signal='SELL' THEN signal_correct END) AS NUMERIC)*100,1) AS sell_acc,
+                   ROUND(CAST(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_win,
+                   ROUND(CAST(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_loss
             FROM ai_signals WHERE signal_correct IS NOT NULL
         """)
 
@@ -899,11 +899,7 @@ if __name__ == "__main__":
     model = NEPSEModel()
 
     if "--train" in sys.argv:
-        lookback = 730
-        for a in sys.argv:
-            if a.startswith("--lookback="):
-                lookback = int(a.split("=", 1)[1])
-        model.train(lookback_days=lookback)
+        model.train()
 
     elif "--signals" in sys.argv:
         date_arg = None
@@ -925,6 +921,6 @@ if __name__ == "__main__":
 
     else:
         print("Usage:")
-        print("  python ai_signal_engine.py --train [--lookback=2190]")
+        print("  python ai_signal_engine.py --train")
         print("  python ai_signal_engine.py --signals")
         print("  python ai_signal_engine.py --backtest")
