@@ -798,6 +798,8 @@ class NEPSEModel:
 
     # ── BACKTESTING ───────────────────────────────────────────
     def backtest(self, start_date=None, end_date=None, full=False):
+        import bisect
+
         end_date = end_date or date.today().strftime("%Y-%m-%d")
         if full and not start_date:
             earliest = db.one("SELECT MIN(signal_date) AS d FROM ai_signals")
@@ -814,39 +816,64 @@ class NEPSEModel:
               AND signal IN ('BUY','SELL') AND signal_correct IS NULL
         """, [start_date, end_date])
 
-        updated = 0
-        for sig in pending:
-            # Exit price: close on (or nearest before) target_date
-            actual = db.one("""
-                SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1
-            """, [sig["symbol"], sig["target_date"]])
+        if not pending:
+            logger.info("No pending signals to evaluate.")
+        else:
+            symbols = sorted({p["symbol"] for p in pending})
+            logger.info(f"{len(pending)} pending signals across {len(symbols)} symbols "
+                        f"— preloading price history in one query...")
 
-            # Entry price: close on (or nearest before) signal_date — this is
-            # the actual basis the signal/ltp was generated from. Previously
-            # this incorrectly looked up the day just before target_date,
-            # which measured a 1-day return at the horizon instead of the
-            # full holding-period return from signal_date to target_date.
-            prev = db.one("""
-                SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1
-            """, [sig["symbol"], sig["signal_date"]])
+            # Previously this ran 2 SELECTs per signal (thousands of round
+            # trips for --full). Instead, pull every close price for the
+            # relevant symbols once, then look up "price on or before date"
+            # in memory with a binary search.
+            placeholders = ",".join(["?"] * len(symbols))
+            price_rows = db.all(f"""
+                SELECT symbol, trade_date, close_price FROM daily_ohlcv
+                WHERE symbol IN ({placeholders})
+                ORDER BY symbol, trade_date ASC
+            """, symbols)
 
-            if not actual or not prev or not prev.get("close_price"):
-                continue
+            price_map = {}
+            for r in price_rows:
+                price_map.setdefault(r["symbol"], []).append((r["trade_date"], r["close_price"]))
 
-            pct = (actual["close_price"] / prev["close_price"] - 1) * 100
-            # Account for transaction costs
-            net_pct = pct - TOTAL_COST_PCT * 100 * 2
-            ok = 1 if ((sig["signal"]=="BUY"  and net_pct >= 0) or
-                       (sig["signal"]=="SELL" and net_pct <= 0)) else 0
+            def price_on_or_before(symbol, target_date_str):
+                series = price_map.get(symbol)
+                if not series:
+                    return None
+                dates = [d for d, _ in series]
+                idx = bisect.bisect_right(dates, target_date_str) - 1
+                return series[idx][1] if idx >= 0 else None
 
-            db.run("""
-                UPDATE ai_signals SET
-                    actual_close_10d=?, actual_pct_10d=?, signal_correct=?
-                WHERE id=?
-            """, [actual["close_price"], round(pct,3), ok, sig["id"]])
-            updated += 1
+            to_update = []
+            skipped   = 0
+            for i, sig in enumerate(pending, 1):
+                actual_close = price_on_or_before(sig["symbol"], sig["target_date"])
+                prev_close   = price_on_or_before(sig["symbol"], sig["signal_date"])
+
+                if actual_close is None or not prev_close:
+                    skipped += 1
+                    continue
+
+                pct = (actual_close / prev_close - 1) * 100
+                net_pct = pct - TOTAL_COST_PCT * 100 * 2
+                ok = 1 if ((sig["signal"]=="BUY"  and net_pct >= 0) or
+                           (sig["signal"]=="SELL" and net_pct <= 0)) else 0
+
+                to_update.append((actual_close, round(pct, 3), ok, sig["id"]))
+
+                if i % 500 == 0:
+                    logger.info(f"  Evaluated {i}/{len(pending)}...")
+
+            logger.info(f"Writing {len(to_update)} results in one batch "
+                        f"({skipped} skipped — missing price data)...")
+            if to_update:
+                db.runmany("""
+                    UPDATE ai_signals SET
+                        actual_close_10d=?, actual_pct_10d=?, signal_correct=?
+                    WHERE id=?
+                """, to_update)
 
         # Print summary
         stats = db.one("""
@@ -941,19 +968,25 @@ class NEPSEModel:
         """)
         logger.info(f"Found {len(rows)} BUY/SELL signals to inspect")
 
-        updated = 0
+        to_update = []
         for r in rows:
             correct_target = self._nth_trading_day(r["signal_date"], 10)
             if correct_target != r["target_date"]:
-                db.run("""
-                    UPDATE ai_signals SET
-                        target_date=?,
-                        actual_close_10d=NULL,
-                        actual_pct_10d=NULL,
-                        signal_correct=NULL
-                    WHERE id=?
-                """, [correct_target, r["id"]])
-                updated += 1
+                to_update.append((correct_target, r["id"]))
+
+        logger.info(f"{len(to_update)} rows need re-dating — writing in one batch...")
+
+        if to_update:
+            db.runmany("""
+                UPDATE ai_signals SET
+                    target_date=?,
+                    actual_close_10d=NULL,
+                    actual_pct_10d=NULL,
+                    signal_correct=NULL
+                WHERE id=?
+            """, to_update)
+
+        updated = len(to_update)
 
         logger.info(f"Re-dated {updated} signals ({len(rows) - updated} were already correct)")
         logger.info("Next step: python ai_signal_engine.py --backtest --full")
