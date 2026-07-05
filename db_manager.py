@@ -199,11 +199,38 @@ SQLITE_INDEXES = [i.replace(" IF NOT EXISTS ", " IF NOT EXISTS ") for i in PG_IN
 class DB:
     def __init__(self):
         self._pg = USE_POSTGRES
-        self._pg_conn = None   # persistent connection, reused across calls
+        self._conn = None
 
     def conn(self):
+        """
+        Return a live connection, reusing a cached one where possible.
+        Opening a fresh TCP+TLS+auth connection to a remote Postgres pooler
+        for every single query is what caused multi-hour runs previously —
+        this reuses one connection and only reconnects if it's actually dead.
+        """
         if self._pg:
-            return self._pg_connect()
+            import psycopg2
+            if self._conn is not None:
+                try:
+                    cur = self._conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    cur.close()
+                    return self._conn
+                except Exception:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+            self._conn = psycopg2.connect(
+                DATABASE_URL,
+                sslmode="require",
+                connect_timeout=15,
+                client_encoding="utf8",
+                options="-c statement_timeout=30000",
+            )
+            return self._conn
         else:
             import sqlite3
             c = sqlite3.connect(DB_PATH, timeout=30)
@@ -211,37 +238,6 @@ class DB:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA foreign_keys=OFF")
             return c
-
-    def _pg_connect(self):
-        """Reuse one persistent connection instead of opening a new TCP+TLS
-        connection for every single query. Reconnects if the cached
-        connection has died. connect_timeout prevents an indefinite hang if
-        the network path to Supabase is slow/unreachable — without it,
-        psycopg2 can block for a very long time with no error at all."""
-        import psycopg2
-        if self._pg_conn is not None:
-            try:
-                if self._pg_conn.closed:
-                    self._pg_conn = None
-                else:
-                    # cheap liveness check
-                    cur = self._pg_conn.cursor()
-                    cur.execute("SELECT 1")
-                    cur.close()
-                    return self._pg_conn
-            except Exception:
-                try:
-                    self._pg_conn.close()
-                except Exception:
-                    pass
-                self._pg_conn = None
-
-        self._pg_conn = psycopg2.connect(
-            DATABASE_URL, sslmode="require", connect_timeout=15,
-            client_encoding="utf8",
-            options="-c statement_timeout=30000"  # kill any single query after 30s
-        )
-        return self._pg_conn
 
     def _rows(self, cur):
         if self._pg:
@@ -261,6 +257,16 @@ class DB:
 
     def _sql(self, sql):
         return _to_pg(sql) if self._pg else sql
+
+    def _release(self, c):
+        """
+        SQLite connections are cheap/local — close them each call as before.
+        Postgres connections are now cached on self._conn and reused across
+        calls (see conn()); closing here would force a full reconnect on
+        every single query again, which is the exact bug we're fixing.
+        """
+        if not self._pg:
+            c.close()
 
     def init(self):
         tables  = PG_TABLES    if self._pg else SQLITE_TABLES
@@ -282,8 +288,7 @@ class DB:
             c.rollback()
             raise e
         finally:
-            if not self._pg:
-                c.close()
+            self._release(c)
 
     def run(self, sql, params=None):
         sql = self._sql(sql)
@@ -297,8 +302,7 @@ class DB:
             c.rollback()
             raise e
         finally:
-            if not self._pg:
-                c.close()
+            self._release(c)
 
     def runmany(self, sql, params_list):
         if not params_list:
@@ -318,8 +322,7 @@ class DB:
             c.rollback()
             raise e
         finally:
-            if not self._pg:
-                c.close()
+            self._release(c)
 
     def one(self, sql, params=None):
         sql = self._sql(sql)
@@ -329,8 +332,7 @@ class DB:
             cur.execute(sql, params or [])
             return self._row(cur)
         finally:
-            if not self._pg:
-                c.close()
+            self._release(c)
 
     def all(self, sql, params=None):
         sql = self._sql(sql)
@@ -340,8 +342,7 @@ class DB:
             cur.execute(sql, params or [])
             return self._rows(cur)
         finally:
-            if not self._pg:
-                c.close()
+            self._release(c)
 
     def now(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
