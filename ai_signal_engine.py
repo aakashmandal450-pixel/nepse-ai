@@ -878,13 +878,13 @@ class NEPSEModel:
         # Print summary
         stats = db.one("""
             SELECT COUNT(*) AS total,
-                   SUM(signal='BUY')  AS buys,
-                   SUM(signal='SELL') AS sells,
-                   ROUND(AVG(signal_correct)*100,1) AS accuracy,
-                   ROUND(AVG(CASE WHEN signal='BUY'  THEN signal_correct END)*100,1) AS buy_acc,
-                   ROUND(AVG(CASE WHEN signal='SELL' THEN signal_correct END)*100,1) AS sell_acc,
-                   ROUND(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END),2) AS avg_win,
-                   ROUND(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END),2) AS avg_loss
+                   SUM(CASE WHEN signal='BUY'  THEN 1 ELSE 0 END) AS buys,
+                   SUM(CASE WHEN signal='SELL' THEN 1 ELSE 0 END) AS sells,
+                   ROUND(CAST(AVG(signal_correct)*100 AS NUMERIC),1) AS accuracy,
+                   ROUND(CAST(AVG(CASE WHEN signal='BUY'  THEN signal_correct END)*100 AS NUMERIC),1) AS buy_acc,
+                   ROUND(CAST(AVG(CASE WHEN signal='SELL' THEN signal_correct END)*100 AS NUMERIC),1) AS sell_acc,
+                   ROUND(CAST(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_win,
+                   ROUND(CAST(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_loss
             FROM ai_signals WHERE signal_correct IS NOT NULL
         """)
 
