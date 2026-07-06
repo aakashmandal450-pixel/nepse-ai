@@ -20,7 +20,7 @@ from settings import *
 MODELS_PATH = Path(MODELS_DIR)
 MODELS_PATH.mkdir(exist_ok=True)
 
-META_COLS = {"symbol","trade_date","label_buy","label_sell","next_day_return",
+META_COLS = {"symbol","trade_date","label_buy","label_sell","next_10d_return",
              "close_price","open_price","high_price","low_price",
              "adj_close","volume","turnover","total_trades"}
 
@@ -244,11 +244,19 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
         df["rel_vs_nepse"] = df["ret_1d"] - df["nepse_pct"] / 100
 
     # ── Label ─────────────────────────────────────────────────
+    # This must match the horizon the system actually trades on: target_10d,
+    # the ATR-based stop-loss/take-profit, and price_projections are all
+    # framed around a 10-trading-day swing. Previously this used c.shift(-1)
+    # (next single day) — training the model on a completely different,
+    # much noisier target than the one signals are generated/evaluated for.
     if label:
-        df["next_day_return"] = c.shift(-1) / c - 1
-        df["label_buy"]  = (df["next_day_return"] >= TARGET_MOVE_PCT).astype(int)
-        df["label_sell"] = (df["next_day_return"] <= -TARGET_MOVE_PCT).astype(int)
-        df.dropna(subset=["label_buy"], inplace=True)
+        df["next_10d_return"] = c.shift(-10) / c - 1
+        # Drop rows with no 10-day-forward price yet BEFORE labeling — a
+        # NaN >= threshold comparison silently evaluates to False, so doing
+        # dropna on label_buy afterward would never actually remove anything.
+        df.dropna(subset=["next_10d_return"], inplace=True)
+        df["label_buy"]  = (df["next_10d_return"] >= TARGET_MOVE_PCT).astype(int)
+        df["label_sell"] = (df["next_10d_return"] <= -TARGET_MOVE_PCT).astype(int)
 
     df.reset_index(inplace=True)
     df.rename(columns={"index":"trade_date","trade_date":"trade_date"}, errors="ignore")
@@ -434,9 +442,13 @@ class NEPSEModel:
 
         data = pd.concat(frames, ignore_index=True)
         self.feat_cols = [c for c in data.columns if c not in META_COLS
-                          and c != "label_sell" and c != "next_day_return"]
+                          and c != "label_sell" and c != "next_10d_return"]
 
         logger.info(f"Dataset: {len(data):,} rows x {len(self.feat_cols)} features")
+        buy_pct  = data["label_buy"].mean() * 100
+        sell_pct = data["label_sell"].mean() * 100
+        logger.info(f"Label balance (10-day, {TARGET_MOVE_PCT*100:.0f}% threshold): "
+                    f"{buy_pct:.1f}% BUY-labeled, {sell_pct:.1f}% SELL-labeled")
 
         # Walk-forward validation
         self._walk_forward(data)
@@ -516,7 +528,7 @@ class NEPSEModel:
             wr = float(y_te[buy_mask].mean()) if buy_mask.sum() > 0 else 0
             wins.append(wr)
 
-            rets = te["next_day_return"].values
+            rets = te["next_10d_return"].values
             brets = rets[buy_mask]
             gp = brets[brets > 0].sum()
             gl = abs(brets[brets < 0].sum())
