@@ -876,6 +876,10 @@ class NEPSEModel:
                 """, to_update)
 
         # Print summary
+        # NOTE: avg_win/avg_loss must be split by signal type. A "correct"
+        # SELL has a NEGATIVE actual_pct_10d (price fell, as predicted) while
+        # a "correct" BUY has a POSITIVE one — averaging both together
+        # produces a meaningless composite number.
         stats = db.one("""
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN signal='BUY'  THEN 1 ELSE 0 END) AS buys,
@@ -883,19 +887,26 @@ class NEPSEModel:
                    ROUND(CAST(AVG(signal_correct)*100 AS NUMERIC),1) AS accuracy,
                    ROUND(CAST(AVG(CASE WHEN signal='BUY'  THEN signal_correct END)*100 AS NUMERIC),1) AS buy_acc,
                    ROUND(CAST(AVG(CASE WHEN signal='SELL' THEN signal_correct END)*100 AS NUMERIC),1) AS sell_acc,
-                   ROUND(CAST(AVG(CASE WHEN signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_win,
-                   ROUND(CAST(AVG(CASE WHEN signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS avg_loss
+                   ROUND(CAST(AVG(CASE WHEN signal='BUY' AND signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS buy_avg_win,
+                   ROUND(CAST(AVG(CASE WHEN signal='BUY' AND signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS buy_avg_loss,
+                   ROUND(CAST(AVG(CASE WHEN signal='SELL' AND signal_correct=1 THEN actual_pct_10d END) AS NUMERIC),2) AS sell_avg_win,
+                   ROUND(CAST(AVG(CASE WHEN signal='SELL' AND signal_correct=0 THEN actual_pct_10d END) AS NUMERIC),2) AS sell_avg_loss,
+                   ROUND(CAST(AVG(CASE WHEN signal='BUY'  THEN actual_pct_10d END) AS NUMERIC),2) AS buy_avg_return,
+                   ROUND(CAST(AVG(CASE WHEN signal='SELL' THEN actual_pct_10d END) AS NUMERIC),2) AS sell_avg_return
             FROM ai_signals WHERE signal_correct IS NOT NULL
         """)
 
         if stats and stats.get("total",0) > 0:
+            def fmt(val):
+                return "n/a" if val is None else f"{val:+.2f}%"
+
             logger.info("\n=== BACKTEST RESULTS ===")
-            logger.info(f"Total signals:   {stats['total']}")
-            logger.info(f"Overall accuracy:{stats['accuracy']}%")
-            logger.info(f"BUY accuracy:    {stats['buy_acc']}%")
-            logger.info(f"SELL accuracy:   {stats['sell_acc']}%")
-            logger.info(f"Avg win:         +{stats['avg_win']}%")
-            logger.info(f"Avg loss:         {stats['avg_loss']}%")
+            logger.info(f"Total signals:      {stats['total']} ({stats['buys']} BUY, {stats['sells']} SELL)")
+            logger.info(f"Overall accuracy:   {stats['accuracy']}%")
+            logger.info(f"BUY accuracy:       {stats['buy_acc']}%  (avg return {fmt(stats['buy_avg_return'])})")
+            logger.info(f"SELL accuracy:      {stats['sell_acc']}%  (avg return {fmt(stats['sell_avg_return'])})")
+            logger.info(f"BUY  avg win/loss:  {fmt(stats['buy_avg_win'])} / {fmt(stats['buy_avg_loss'])}")
+            logger.info(f"SELL avg win/loss:  {fmt(stats['sell_avg_win'])} / {fmt(stats['sell_avg_loss'])}")
 
         return dict(stats) if stats else {}
 
