@@ -223,14 +223,31 @@ class DB:
                     except Exception:
                         pass
                     self._conn = None
-            self._conn = psycopg2.connect(
-                DATABASE_URL,
-                sslmode="require",
-                connect_timeout=15,
-                client_encoding="utf8",
-                options="-c statement_timeout=30000",
-            )
-            return self._conn
+            # The initial handshake to the Supabase pooler occasionally fails
+            # with "server didn't return client encoding" — an intermittent
+            # network-level glitch (not a real config problem, since the
+            # same URL/credentials work moments later). Retry a few times
+            # with a short backoff instead of failing the whole run on one
+            # flaky attempt.
+            import time
+            last_err = None
+            for attempt in range(4):
+                try:
+                    self._conn = psycopg2.connect(
+                        DATABASE_URL,
+                        sslmode="require",
+                        connect_timeout=15,
+                        client_encoding="utf8",
+                        options="-c statement_timeout=30000",
+                    )
+                    return self._conn
+                except Exception as e:
+                    last_err = e
+                    if attempt < 3:
+                        logger.warning(f"Postgres connect attempt {attempt+1} failed "
+                                        f"({e}) — retrying...")
+                        time.sleep(1.5 * (attempt + 1))
+            raise last_err
         else:
             import sqlite3
             c = sqlite3.connect(DB_PATH, timeout=30)
