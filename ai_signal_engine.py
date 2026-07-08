@@ -28,7 +28,95 @@ META_COLS = {"symbol","trade_date","label_buy","label_sell","next_10d_return",
 # ─────────────────────────────────────────────────────────────
 #  FEATURE ENGINEERING
 # ─────────────────────────────────────────────────────────────
-def build_features(symbol: str, cutoff: str, label: bool = True):
+def _preload_feature_cache(cutoff: str):
+    """
+    Bulk-load everything build_features()/generate_signals() need across ALL
+    active symbols in a handful of queries, instead of ~6-10 queries PER
+    SYMBOL (which was taking 15-30+ minutes across ~640 symbols due to
+    per-query network round trips to a remote Postgres pooler).
+    Returns a dict of preloaded, symbol-grouped data.
+    """
+    def group(rows, drop_symbol=True):
+        out = {}
+        for r in rows:
+            sym = r.get("symbol")
+            out.setdefault(sym, []).append(
+                {k: v for k, v in r.items() if k != "symbol"} if drop_symbol else r
+            )
+        return out
+
+    ohlcv_rows = db.all("""
+        SELECT symbol, trade_date, open_price, high_price, low_price,
+               close_price, adj_close, volume, turnover, total_trades
+        FROM daily_ohlcv WHERE trade_date>=? ORDER BY symbol, trade_date ASC
+    """, [cutoff])
+
+    ti_rows = db.all("""
+        SELECT symbol, calc_date,
+               ema9, ema21, ema50, ema200,
+               macd_line, macd_signal, macd_histogram, adx,
+               rsi14, stoch_k, stoch_d, cci14, williams_r, roc10,
+               obv, volume_ratio, cmf, mfi14,
+               atr14, atr_pct, bb_upper, bb_middle, bb_lower,
+               bb_pct_b, bb_bandwidth, bb_squeeze,
+               float_adj_volume, relative_strength,
+               dist_from_52w_high, dist_from_52w_low,
+               pattern_doji, pattern_hammer, pattern_engulf_bull,
+               pattern_engulf_bear, pattern_morning_star, pattern_evening_star,
+               pattern_shooting_star, signal_strength
+        FROM technical_indicators WHERE calc_date>=? ORDER BY symbol, calc_date ASC
+    """, [cutoff])
+
+    bc_rows = db.all("""
+        SELECT symbol, trade_date, top3_buy_pct, top3_sell_pct,
+               unique_buyers, unique_sellers,
+               avg_trade_size, large_trades_pct,
+               accumulation_score, wyckoff_phase
+        FROM broker_concentration WHERE trade_date>=? ORDER BY symbol, trade_date ASC
+    """, [cutoff])
+
+    action_rows = db.all("""
+        SELECT symbol, action_type, ex_date, book_close_date, announcement_date, value
+        FROM corporate_actions
+    """)
+
+    fund_rows = db.all("""
+        SELECT symbol, eps, pe_ratio, book_value, price_to_book, roe, dividend_yield, report_date
+        FROM fundamentals ORDER BY symbol, report_date DESC
+    """)
+
+    nepse_rows = db.all("""
+        SELECT index_date, close_value, pct_change FROM indices
+        WHERE index_name='NEPSE' AND index_date>=? ORDER BY index_date ASC
+    """, [cutoff])
+
+    # wyckoff_phase isn't a build_features input (it's used directly in
+    # generate_signals), so split it off rather than let it get pulled into
+    # the numeric feature conversion inside build_features.
+    bc_grouped = group(bc_rows)
+    bc_for_features = {
+        sym: [{k: v for k, v in r.items() if k != "wyckoff_phase"} for r in rows]
+        for sym, rows in bc_grouped.items()
+    }
+
+    fund_grouped = group(fund_rows)
+    fund_latest = {
+        sym: {k: v for k, v in rows[0].items() if k != "report_date"}
+        for sym, rows in fund_grouped.items() if rows
+    }
+
+    return {
+        "ohlcv":   group(ohlcv_rows),
+        "ti":      group(ti_rows),
+        "bc":      bc_for_features,
+        "wyckoff": bc_grouped,   # trade_date + wyckoff_phase (+ unused fields)
+        "actions": group(action_rows),
+        "fund":    fund_latest,
+        "nepse":   nepse_rows,
+    }
+
+
+def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = None):
     """Build feature matrix for one stock from all data sources."""
     try:
         import pandas as pd
@@ -36,13 +124,16 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
         return None
 
     # Base OHLCV
-    rows = db.all("""
-        SELECT trade_date, open_price, high_price, low_price,
-               close_price, adj_close, volume, turnover, total_trades
-        FROM daily_ohlcv
-        WHERE symbol=? AND trade_date>=?
-        ORDER BY trade_date ASC
-    """, [symbol, cutoff])
+    if cache is not None:
+        rows = cache["ohlcv"].get(symbol, [])
+    else:
+        rows = db.all("""
+            SELECT trade_date, open_price, high_price, low_price,
+                   close_price, adj_close, volume, turnover, total_trades
+            FROM daily_ohlcv
+            WHERE symbol=? AND trade_date>=?
+            ORDER BY trade_date ASC
+        """, [symbol, cutoff])
 
     if len(rows) < 30:
         return None
@@ -88,23 +179,26 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
     df["consec_up"] = df["consec_up"] * df["up_day"]
 
     # ── Technical indicators from DB ──────────────────────────
-    ti_rows = db.all("""
-        SELECT calc_date,
-               ema9, ema21, ema50, ema200,
-               macd_line, macd_signal, macd_histogram, adx,
-               rsi14, stoch_k, stoch_d, cci14, williams_r, roc10,
-               obv, volume_ratio, cmf, mfi14,
-               atr14, atr_pct, bb_upper, bb_middle, bb_lower,
-               bb_pct_b, bb_bandwidth, bb_squeeze,
-               float_adj_volume, relative_strength,
-               dist_from_52w_high, dist_from_52w_low,
-               pattern_doji, pattern_hammer, pattern_engulf_bull,
-               pattern_engulf_bear, pattern_morning_star, pattern_evening_star,
-               pattern_shooting_star, signal_strength
-        FROM technical_indicators
-        WHERE symbol=? AND calc_date>=?
-        ORDER BY calc_date ASC
-    """, [symbol, cutoff])
+    if cache is not None:
+        ti_rows = cache["ti"].get(symbol, [])
+    else:
+        ti_rows = db.all("""
+            SELECT calc_date,
+                   ema9, ema21, ema50, ema200,
+                   macd_line, macd_signal, macd_histogram, adx,
+                   rsi14, stoch_k, stoch_d, cci14, williams_r, roc10,
+                   obv, volume_ratio, cmf, mfi14,
+                   atr14, atr_pct, bb_upper, bb_middle, bb_lower,
+                   bb_pct_b, bb_bandwidth, bb_squeeze,
+                   float_adj_volume, relative_strength,
+                   dist_from_52w_high, dist_from_52w_low,
+                   pattern_doji, pattern_hammer, pattern_engulf_bull,
+                   pattern_engulf_bear, pattern_morning_star, pattern_evening_star,
+                   pattern_shooting_star, signal_strength
+            FROM technical_indicators
+            WHERE symbol=? AND calc_date>=?
+            ORDER BY calc_date ASC
+        """, [symbol, cutoff])
 
     if ti_rows:
         import pandas as pd
@@ -143,15 +237,18 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
             ).astype(int)
 
     # ── Broker concentration features ─────────────────────────
-    bc_rows = db.all("""
-        SELECT trade_date, top3_buy_pct, top3_sell_pct,
-               unique_buyers, unique_sellers,
-               avg_trade_size, large_trades_pct,
-               accumulation_score
-        FROM broker_concentration
-        WHERE symbol=? AND trade_date>=?
-        ORDER BY trade_date ASC
-    """, [symbol, cutoff])
+    if cache is not None:
+        bc_rows = cache["bc"].get(symbol, [])
+    else:
+        bc_rows = db.all("""
+            SELECT trade_date, top3_buy_pct, top3_sell_pct,
+                   unique_buyers, unique_sellers,
+                   avg_trade_size, large_trades_pct,
+                   accumulation_score
+            FROM broker_concentration
+            WHERE symbol=? AND trade_date>=?
+            ORDER BY trade_date ASC
+        """, [symbol, cutoff])
 
     if bc_rows:
         import pandas as pd
@@ -176,10 +273,13 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
             )
 
     # ── Corporate action proximity ────────────────────────────
-    actions = db.all("""
-        SELECT action_type, ex_date, book_close_date, announcement_date, value
-        FROM corporate_actions WHERE symbol=?
-    """, [symbol])
+    if cache is not None:
+        actions = cache["actions"].get(symbol, [])
+    else:
+        actions = db.all("""
+            SELECT action_type, ex_date, book_close_date, announcement_date, value
+            FROM corporate_actions WHERE symbol=?
+        """, [symbol])
 
     df["days_to_bookclose"] = 999.0
     df["days_to_agm"]       = 999.0
@@ -217,22 +317,28 @@ def build_features(symbol: str, cutoff: str, label: bool = True):
             pass
 
     # ── Fundamentals ──────────────────────────────────────────
-    fund = db.one("""
-        SELECT eps, pe_ratio, book_value, price_to_book, roe, dividend_yield
-        FROM fundamentals WHERE symbol=?
-        ORDER BY report_date DESC LIMIT 1
-    """, [symbol])
+    if cache is not None:
+        fund = cache["fund"].get(symbol)
+    else:
+        fund = db.one("""
+            SELECT eps, pe_ratio, book_value, price_to_book, roe, dividend_yield
+            FROM fundamentals WHERE symbol=?
+            ORDER BY report_date DESC LIMIT 1
+        """, [symbol])
 
     if fund:
         for k, v2 in fund.items():
             df[f"fund_{k}"] = float(v2 or 0)
 
     # ── NEPSE index relative return ───────────────────────────
-    nepse_rows = db.all("""
-        SELECT index_date, close_value, pct_change FROM indices
-        WHERE index_name='NEPSE' AND index_date>=?
-        ORDER BY index_date ASC
-    """, [cutoff])
+    if cache is not None:
+        nepse_rows = cache["nepse"]
+    else:
+        nepse_rows = db.all("""
+            SELECT index_date, close_value, pct_change FROM indices
+            WHERE index_name='NEPSE' AND index_date>=?
+            ORDER BY index_date ASC
+        """, [cutoff])
 
     if nepse_rows:
         import pandas as pd
@@ -320,24 +426,31 @@ def detect_time_series_type(df_slice) -> str:
 # ─────────────────────────────────────────────────────────────
 def compute_price_projections(symbol: str, ltp: float, atr: float,
                                conf: float, signal: str,
-                               signal_date: str) -> dict:
+                               signal_date: str, recent_closes: list = None) -> tuple:
     """
     Compute probabilistic price range for 10 and 20 days.
     Based on ATR, historical volatility, and ML confidence.
+
+    Returns (result_dict, projection_rows) — the caller is responsible for
+    batch-writing projection_rows via db.runmany() rather than this function
+    inserting one-by-one (previously 2 individual commits per symbol here,
+    across ~640 symbols, was a major part of --signals taking 15-30+ min).
     """
     if ltp <= 0 or atr <= 0:
-        return {}
+        return {}, []
 
-    # Historical volatility from last 20 candles
-    rows = db.all("""
-        SELECT close_price FROM daily_ohlcv
-        WHERE symbol=? ORDER BY trade_date DESC LIMIT 22
-    """, [symbol])
+    # Historical volatility from last 20 candles (most-recent-first)
+    if recent_closes is None:
+        rows = db.all("""
+            SELECT close_price FROM daily_ohlcv
+            WHERE symbol=? ORDER BY trade_date DESC LIMIT 22
+        """, [symbol])
+        recent_closes = [float(r["close_price"]) for r in rows]
 
     hist_vol = atr / ltp  # default: ATR-based
-    if len(rows) >= 5:
+    if len(recent_closes) >= 5:
         try:
-            prices  = [float(r["close_price"]) for r in rows]
+            prices  = recent_closes
             returns = [(prices[i] / prices[i+1] - 1) for i in range(len(prices)-1)]
             hist_vol = (sum(r**2 for r in returns) / len(returns)) ** 0.5
         except Exception:
@@ -345,6 +458,7 @@ def compute_price_projections(symbol: str, ltp: float, atr: float,
 
     # Project using random walk assumption scaled by confidence
     conf_factor = conf / 100
+    projection_rows = []
     for horizon in [10, 20]:
         vol_h = hist_vol * (horizon ** 0.5)
 
@@ -365,35 +479,23 @@ def compute_price_projections(symbol: str, ltp: float, atr: float,
         prob_up   = round(conf_factor * 100 if signal == "BUY" else (1 - conf_factor) * 100, 1)
         prob_down = round(100 - prob_up, 1)
 
-        try:
-            db.run("""
-                INSERT INTO price_projections
-                  (symbol, projection_date, horizon_days,
-                   current_price, target_price, upside_price, downside_price,
-                   probability_up, probability_down, atr_based, method, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(symbol, projection_date, horizon_days) DO UPDATE SET
-                    target_price=excluded.target_price,
-                    upside_price=excluded.upside_price,
-                    downside_price=excluded.downside_price
-            """, [
-                symbol, signal_date, horizon, ltp,
-                round(expected, 2), round(upside, 2), round(downside, 2),
-                prob_up, prob_down,
-                round(atr, 2), "ATR+HistVol", db.now(),
-            ])
-        except Exception:
-            pass
+        projection_rows.append((
+            symbol, signal_date, horizon, ltp,
+            round(expected, 2), round(upside, 2), round(downside, 2),
+            prob_up, prob_down,
+            round(atr, 2), "ATR+HistVol", db.now(),
+        ))
 
     # Return 10-day values for the signal table
     vol_10 = hist_vol * (10 ** 0.5)
-    return {
+    result = {
         "upside_10d":   round(ltp * (1 + vol_10 * 1.5), 2),
         "downside_10d": round(ltp * (1 - vol_10 * 0.8), 2),
         "target_10d":   round(ltp * (1 + vol_10 * conf_factor * 0.5
                                      if signal=="BUY"
                                      else -vol_10 * conf_factor * 0.5), 2),
     }
+    return result, projection_rows
 
 
 # ─────────────────────────────────────────────────────────────
@@ -428,9 +530,14 @@ class NEPSEModel:
         stocks  = db.all("SELECT symbol FROM stocks WHERE is_active=1")
         frames  = []
 
+        logger.info(f"Preloading feature data for {len(stocks)} symbols in bulk "
+                    f"(instead of ~10 queries/symbol)...")
+        cache = _preload_feature_cache(cutoff)
+        logger.info("Preload complete — building features per symbol from cache...")
+
         for i, row in enumerate(stocks, 1):
             sym = row["symbol"]
-            df  = build_features(sym, cutoff, label=True)
+            df  = build_features(sym, cutoff, label=True, cache=cache)
             if df is not None and len(df) >= 60:
                 frames.append(df)
             if i % 30 == 0:
@@ -567,11 +674,17 @@ class NEPSEModel:
 
         cutoff = (date.fromisoformat(signal_date) - timedelta(days=365)).strftime("%Y-%m-%d")
         stocks = db.all("SELECT symbol FROM stocks WHERE is_active=1")
+
+        logger.info(f"Preloading feature data for {len(stocks)} symbols in bulk "
+                    f"(instead of ~10 queries/symbol)...")
+        cache = _preload_feature_cache(cutoff)
+        logger.info("Preload complete — building features per symbol from cache...")
+
         frames = []
 
         for row in stocks:
             sym = row["symbol"]
-            df  = build_features(sym, cutoff, label=False)
+            df  = build_features(sym, cutoff, label=False, cache=cache)
             if df is not None and len(df) > 0:
                 last = df.iloc[[-1]].copy()
                 frames.append(last)
@@ -594,6 +707,7 @@ class NEPSEModel:
 
         signals = []
         now     = db.now()
+        all_projection_rows = []
 
         for i, row in feat_df.iterrows():
             sym  = row.get("symbol","")
@@ -605,7 +719,7 @@ class NEPSEModel:
             macd_h = float(row.get("ti_macd_histogram", 0))
             vol_r  = float(row.get("vol_ratio20", 1))
             accum  = float(row.get("broker_accumulation_score", 0))
-            beta   = self._compute_beta(sym, signal_date)
+            beta   = self._compute_beta(sym, signal_date, cache=cache)
 
             # Fundamentals
             pe = float(row.get("fund_pe_ratio", 0))
@@ -620,29 +734,32 @@ class NEPSEModel:
 
             # Strategy & Wyckoff phase
             strategy = detect_strategy(dict(row))
-            phase    = db.one("""
-                SELECT wyckoff_phase FROM broker_concentration
-                WHERE symbol=? AND trade_date<=?
-                ORDER BY trade_date DESC LIMIT 1
-            """, [sym, signal_date])
-            phase_str = (phase.get("wyckoff_phase") if phase else None) or "Neutral"
+            wyckoff_rows = cache["wyckoff"].get(sym, [])
+            phase_str = "Neutral"
+            for r in reversed(wyckoff_rows):
+                if r["trade_date"] <= signal_date:
+                    phase_str = r.get("wyckoff_phase") or "Neutral"
+                    break
 
-            # Time series type
-            close_hist = db.all("""
-                SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? ORDER BY trade_date DESC LIMIT 30
-            """, [sym])
-            ts_type = detect_time_series_type(
-                [float(r["close_price"]) for r in close_hist])
+            # Time series type — last 30 closes at/before signal_date
+            ohlcv_hist = cache["ohlcv"].get(sym, [])
+            closes_asc = [float(r["close_price"]) for r in ohlcv_hist
+                          if r["trade_date"] <= signal_date]
+            ts_type = detect_time_series_type(closes_asc[-30:])
 
             # ATR-based stop loss
             sl = round(ltp - 1.5 * atr, 2)
             tp = round(ltp + 3.0 * atr, 2)
             rr = round((tp - ltp) / (ltp - sl + 1e-9), 2)
 
-            # Price projections
-            projections = compute_price_projections(
-                sym, ltp, atr, conf * 100, signal, signal_date)
+            # Price projections — use the same closes_asc already sliced
+            # above (most-recent-first, matching the function's expected
+            # order), instead of a fresh per-symbol query.
+            recent_closes = closes_asc[-22:][::-1]
+            projections, proj_rows = compute_price_projections(
+                sym, ltp, atr, conf * 100, signal, signal_date,
+                recent_closes=recent_closes)
+            all_projection_rows.extend(proj_rows)
             upside_10d  = projections.get("upside_10d", tp)
             downside_10d= projections.get("downside_10d", sl)
             target_10d  = projections.get("target_10d", tp)
@@ -688,6 +805,20 @@ class NEPSEModel:
             reverse=True
         )
 
+        if all_projection_rows:
+            logger.info(f"Writing {len(all_projection_rows)} price projections in one batch...")
+            db.runmany("""
+                INSERT INTO price_projections
+                  (symbol, projection_date, horizon_days,
+                   current_price, target_price, upside_price, downside_price,
+                   probability_up, probability_down, atr_based, method, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, projection_date, horizon_days) DO UPDATE SET
+                    target_price=excluded.target_price,
+                    upside_price=excluded.upside_price,
+                    downside_price=excluded.downside_price
+            """, all_projection_rows)
+
         self._save_signals(signals, now)
         self._export_signals(signals, signal_date)
 
@@ -729,19 +860,26 @@ class NEPSEModel:
 
         return reasons[:5]
 
-    def _compute_beta(self, symbol, signal_date):
+    def _compute_beta(self, symbol, signal_date, cache=None):
         """3-month beta vs NEPSE index."""
         cutoff = (date.fromisoformat(signal_date) - timedelta(days=90)).strftime("%Y-%m-%d")
-        stock_rows = db.all("""
-            SELECT close_price FROM daily_ohlcv
-            WHERE symbol=? AND trade_date>=?
-            ORDER BY trade_date ASC
-        """, [symbol, cutoff])
-        nepse_rows = db.all("""
-            SELECT close_value FROM indices
-            WHERE index_name='NEPSE' AND index_date>=?
-            ORDER BY index_date ASC
-        """, [cutoff])
+
+        if cache is not None:
+            stock_rows = [r for r in cache["ohlcv"].get(symbol, [])
+                          if r["trade_date"] >= cutoff]
+            nepse_rows = [r for r in cache["nepse"]
+                          if r["index_date"] >= cutoff]
+        else:
+            stock_rows = db.all("""
+                SELECT close_price FROM daily_ohlcv
+                WHERE symbol=? AND trade_date>=?
+                ORDER BY trade_date ASC
+            """, [symbol, cutoff])
+            nepse_rows = db.all("""
+                SELECT close_value FROM indices
+                WHERE index_name='NEPSE' AND index_date>=?
+                ORDER BY index_date ASC
+            """, [cutoff])
 
         try:
             if len(stock_rows) < 5 or len(nepse_rows) < 5:
