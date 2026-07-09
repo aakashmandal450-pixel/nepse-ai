@@ -99,11 +99,11 @@ def _preload_feature_cache(cutoff: str):
         for sym, rows in bc_grouped.items()
     }
 
+    # Keep the FULL list per symbol (with report_date) rather than picking
+    # only the latest here — build_features needs to pick the latest report
+    # that existed AS OF a given date when regenerating historical signals,
+    # not just the globally-latest one.
     fund_grouped = group(fund_rows)
-    fund_latest = {
-        sym: {k: v for k, v in rows[0].items() if k != "report_date"}
-        for sym, rows in fund_grouped.items() if rows
-    }
 
     return {
         "ohlcv":   group(ohlcv_rows),
@@ -111,13 +111,22 @@ def _preload_feature_cache(cutoff: str):
         "bc":      bc_for_features,
         "wyckoff": bc_grouped,   # trade_date + wyckoff_phase (+ unused fields)
         "actions": group(action_rows),
-        "fund":    fund_latest,
+        "fund":    fund_grouped,
         "nepse":   nepse_rows,
     }
 
 
-def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = None):
-    """Build feature matrix for one stock from all data sources."""
+def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = None, as_of: str = None):
+    """
+    Build feature matrix for one stock from all data sources.
+
+    as_of: if provided, bounds EVERY data source to <= as_of. This matters
+    for regenerating a signal for a past date — without this bound, every
+    query below would silently pull data all the way through today,
+    leaking future information into a "historical" signal. Live signal
+    generation (as_of=None, the default) is unaffected since there's
+    naturally no future data beyond today in the DB anyway.
+    """
     try:
         import pandas as pd
     except ImportError:
@@ -126,14 +135,25 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
     # Base OHLCV
     if cache is not None:
         rows = cache["ohlcv"].get(symbol, [])
+        if as_of is not None:
+            rows = [r for r in rows if r["trade_date"] <= as_of]
     else:
-        rows = db.all("""
-            SELECT trade_date, open_price, high_price, low_price,
-                   close_price, adj_close, volume, turnover, total_trades
-            FROM daily_ohlcv
-            WHERE symbol=? AND trade_date>=?
-            ORDER BY trade_date ASC
-        """, [symbol, cutoff])
+        if as_of is not None:
+            rows = db.all("""
+                SELECT trade_date, open_price, high_price, low_price,
+                       close_price, adj_close, volume, turnover, total_trades
+                FROM daily_ohlcv
+                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                ORDER BY trade_date ASC
+            """, [symbol, cutoff, as_of])
+        else:
+            rows = db.all("""
+                SELECT trade_date, open_price, high_price, low_price,
+                       close_price, adj_close, volume, turnover, total_trades
+                FROM daily_ohlcv
+                WHERE symbol=? AND trade_date>=?
+                ORDER BY trade_date ASC
+            """, [symbol, cutoff])
 
     if len(rows) < 30:
         return None
@@ -181,8 +201,10 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
     # ── Technical indicators from DB ──────────────────────────
     if cache is not None:
         ti_rows = cache["ti"].get(symbol, [])
+        if as_of is not None:
+            ti_rows = [r for r in ti_rows if r["calc_date"] <= as_of]
     else:
-        ti_rows = db.all("""
+        base_ti_sql = """
             SELECT calc_date,
                    ema9, ema21, ema50, ema200,
                    macd_line, macd_signal, macd_histogram, adx,
@@ -196,9 +218,14 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
                    pattern_engulf_bear, pattern_morning_star, pattern_evening_star,
                    pattern_shooting_star, signal_strength
             FROM technical_indicators
-            WHERE symbol=? AND calc_date>=?
+            WHERE symbol=? AND calc_date>=?{as_of_clause}
             ORDER BY calc_date ASC
-        """, [symbol, cutoff])
+        """
+        if as_of is not None:
+            ti_rows = db.all(base_ti_sql.format(as_of_clause=" AND calc_date<=?"),
+                              [symbol, cutoff, as_of])
+        else:
+            ti_rows = db.all(base_ti_sql.format(as_of_clause=""), [symbol, cutoff])
 
     if ti_rows:
         import pandas as pd
@@ -239,16 +266,29 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
     # ── Broker concentration features ─────────────────────────
     if cache is not None:
         bc_rows = cache["bc"].get(symbol, [])
+        if as_of is not None:
+            bc_rows = [r for r in bc_rows if r["trade_date"] <= as_of]
     else:
-        bc_rows = db.all("""
-            SELECT trade_date, top3_buy_pct, top3_sell_pct,
-                   unique_buyers, unique_sellers,
-                   avg_trade_size, large_trades_pct,
-                   accumulation_score
-            FROM broker_concentration
-            WHERE symbol=? AND trade_date>=?
-            ORDER BY trade_date ASC
-        """, [symbol, cutoff])
+        if as_of is not None:
+            bc_rows = db.all("""
+                SELECT trade_date, top3_buy_pct, top3_sell_pct,
+                       unique_buyers, unique_sellers,
+                       avg_trade_size, large_trades_pct,
+                       accumulation_score
+                FROM broker_concentration
+                WHERE symbol=? AND trade_date>=? AND trade_date<=?
+                ORDER BY trade_date ASC
+            """, [symbol, cutoff, as_of])
+        else:
+            bc_rows = db.all("""
+                SELECT trade_date, top3_buy_pct, top3_sell_pct,
+                       unique_buyers, unique_sellers,
+                       avg_trade_size, large_trades_pct,
+                       accumulation_score
+                FROM broker_concentration
+                WHERE symbol=? AND trade_date>=?
+                ORDER BY trade_date ASC
+            """, [symbol, cutoff])
 
     if bc_rows:
         import pandas as pd
@@ -281,6 +321,13 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
             FROM corporate_actions WHERE symbol=?
         """, [symbol])
 
+    if as_of is not None:
+        # Only actions already announced as of the signal date are knowable
+        # at that point in time — an action announced AFTER as_of would be
+        # future information leaking into a historical signal.
+        actions = [a for a in actions
+                   if not a.get("announcement_date") or a["announcement_date"] <= as_of]
+
     df["days_to_bookclose"] = 999.0
     df["days_to_agm"]       = 999.0
     df["has_bonus_90d"]     = 0
@@ -290,6 +337,7 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
         try:
             import pandas as pd
             idx = pd.to_datetime(df.index)
+            reference_date = date.fromisoformat(as_of) if as_of is not None else date.today()
             for act in actions:
                 for col, date_field in [("days_to_bookclose","book_close_date"),
                                          ("days_to_agm","announcement_date")]:
@@ -307,7 +355,7 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
                 adate = act.get("announcement_date","")
                 if adate:
                     try:
-                        age = (date.today() - date.fromisoformat(adate[:10])).days
+                        age = (reference_date - date.fromisoformat(adate[:10])).days
                         if age < 90:
                             if atype == "bonus":   df["has_bonus_90d"]    = 1
                             if atype == "dividend": df["has_dividend_90d"] = 1
@@ -318,13 +366,25 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
 
     # ── Fundamentals ──────────────────────────────────────────
     if cache is not None:
-        fund = cache["fund"].get(symbol)
+        fund_list = cache["fund"].get(symbol, [])
+        if as_of is not None:
+            fund_list = [r for r in fund_list if r.get("report_date") and r["report_date"] <= as_of]
+        fund = fund_list[0] if fund_list else None
+        if fund is not None:
+            fund = {k: v for k, v in fund.items() if k != "report_date"}
     else:
-        fund = db.one("""
-            SELECT eps, pe_ratio, book_value, price_to_book, roe, dividend_yield
-            FROM fundamentals WHERE symbol=?
-            ORDER BY report_date DESC LIMIT 1
-        """, [symbol])
+        if as_of is not None:
+            fund = db.one("""
+                SELECT eps, pe_ratio, book_value, price_to_book, roe, dividend_yield
+                FROM fundamentals WHERE symbol=? AND report_date<=?
+                ORDER BY report_date DESC LIMIT 1
+            """, [symbol, as_of])
+        else:
+            fund = db.one("""
+                SELECT eps, pe_ratio, book_value, price_to_book, roe, dividend_yield
+                FROM fundamentals WHERE symbol=?
+                ORDER BY report_date DESC LIMIT 1
+            """, [symbol])
 
     if fund:
         for k, v2 in fund.items():
@@ -333,12 +393,21 @@ def build_features(symbol: str, cutoff: str, label: bool = True, cache: dict = N
     # ── NEPSE index relative return ───────────────────────────
     if cache is not None:
         nepse_rows = cache["nepse"]
+        if as_of is not None:
+            nepse_rows = [r for r in nepse_rows if r["index_date"] <= as_of]
     else:
-        nepse_rows = db.all("""
-            SELECT index_date, close_value, pct_change FROM indices
-            WHERE index_name='NEPSE' AND index_date>=?
-            ORDER BY index_date ASC
-        """, [cutoff])
+        if as_of is not None:
+            nepse_rows = db.all("""
+                SELECT index_date, close_value, pct_change FROM indices
+                WHERE index_name='NEPSE' AND index_date>=? AND index_date<=?
+                ORDER BY index_date ASC
+            """, [cutoff, as_of])
+        else:
+            nepse_rows = db.all("""
+                SELECT index_date, close_value, pct_change FROM indices
+                WHERE index_name='NEPSE' AND index_date>=?
+                ORDER BY index_date ASC
+            """, [cutoff])
 
     if nepse_rows:
         import pandas as pd
@@ -655,7 +724,7 @@ class NEPSEModel:
             logger.info(f"\nAverage win rate: {sum(wins)/len(wins):.1%} across {fold} folds")
 
     # ── SIGNAL GENERATION ─────────────────────────────────────
-    def generate_signals(self, signal_date=None):
+    def generate_signals(self, signal_date=None, cache=None, stocks=None):
         if not self.xgb:
             logger.error("No trained model. Run: python ai_signal_engine.py --train")
             return []
@@ -673,18 +742,23 @@ class NEPSEModel:
         start  = db.now()
 
         cutoff = (date.fromisoformat(signal_date) - timedelta(days=365)).strftime("%Y-%m-%d")
-        stocks = db.all("SELECT symbol FROM stocks WHERE is_active=1")
+        if stocks is None:
+            stocks = db.all("SELECT symbol FROM stocks WHERE is_active=1")
 
-        logger.info(f"Preloading feature data for {len(stocks)} symbols in bulk "
-                    f"(instead of ~10 queries/symbol)...")
-        cache = _preload_feature_cache(cutoff)
-        logger.info("Preload complete — building features per symbol from cache...")
+        # A caller regenerating MANY historical dates can preload once and
+        # pass the same cache in for every date, instead of re-running these
+        # bulk queries per date.
+        if cache is None:
+            logger.info(f"Preloading feature data for {len(stocks)} symbols in bulk "
+                        f"(instead of ~10 queries/symbol)...")
+            cache = _preload_feature_cache(cutoff)
+            logger.info("Preload complete — building features per symbol from cache...")
 
         frames = []
 
         for row in stocks:
             sym = row["symbol"]
-            df  = build_features(sym, cutoff, label=False, cache=cache)
+            df  = build_features(sym, cutoff, label=False, cache=cache, as_of=signal_date)
             if df is not None and len(df) > 0:
                 last = df.iloc[[-1]].copy()
                 frames.append(last)
@@ -866,20 +940,20 @@ class NEPSEModel:
 
         if cache is not None:
             stock_rows = [r for r in cache["ohlcv"].get(symbol, [])
-                          if r["trade_date"] >= cutoff]
+                          if cutoff <= r["trade_date"] <= signal_date]
             nepse_rows = [r for r in cache["nepse"]
-                          if r["index_date"] >= cutoff]
+                          if cutoff <= r["index_date"] <= signal_date]
         else:
             stock_rows = db.all("""
                 SELECT close_price FROM daily_ohlcv
-                WHERE symbol=? AND trade_date>=?
+                WHERE symbol=? AND trade_date>=? AND trade_date<=?
                 ORDER BY trade_date ASC
-            """, [symbol, cutoff])
+            """, [symbol, cutoff, signal_date])
             nepse_rows = db.all("""
                 SELECT close_value FROM indices
-                WHERE index_name='NEPSE' AND index_date>=?
+                WHERE index_name='NEPSE' AND index_date>=? AND index_date<=?
                 ORDER BY index_date ASC
-            """, [cutoff])
+            """, [cutoff, signal_date])
 
         try:
             if len(stock_rows) < 5 or len(nepse_rows) < 5:
@@ -922,9 +996,30 @@ class NEPSEModel:
                    actual_close_10d, actual_pct_10d, signal_correct, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(signal_date, symbol) DO UPDATE SET
+                    target_date=excluded.target_date,
                     signal=excluded.signal,
                     confidence_pct=excluded.confidence_pct,
-                    target_10d=excluded.target_10d
+                    ltp=excluded.ltp,
+                    target_10d=excluded.target_10d,
+                    target_20d=excluded.target_20d,
+                    stop_loss=excluded.stop_loss,
+                    risk_reward=excluded.risk_reward,
+                    upside_prob_10d=excluded.upside_prob_10d,
+                    downside_prob_10d=excluded.downside_prob_10d,
+                    strategy=excluded.strategy,
+                    wyckoff_phase=excluded.wyckoff_phase,
+                    time_series_type=excluded.time_series_type,
+                    rsi_at_signal=excluded.rsi_at_signal,
+                    macd_at_signal=excluded.macd_at_signal,
+                    volume_ratio_at_signal=excluded.volume_ratio_at_signal,
+                    accumulation_score=excluded.accumulation_score,
+                    beta_3m=excluded.beta_3m,
+                    pe_ratio=excluded.pe_ratio,
+                    key_drivers=excluded.key_drivers,
+                    model_version=excluded.model_version,
+                    actual_close_10d=NULL,
+                    actual_pct_10d=NULL,
+                    signal_correct=NULL
             """, records)
 
     def _export_signals(self, signals, signal_date):
@@ -1106,6 +1201,71 @@ class NEPSEModel:
                 count += 1
         return d.strftime("%Y-%m-%d")
 
+    def regenerate_historical(self, start_date=None, end_date=None):
+        """
+        Regenerate signals for every NEPSE trading day in [start_date,
+        end_date] using the CURRENT model, overwriting whatever previously
+        existed for those dates. This is how you get an apples-to-apples
+        backtest read on a newly retrained model without waiting weeks for
+        fresh signals to mature naturally.
+
+        Preloads ONE broad feature cache spanning the whole range (instead
+        of re-running the bulk preload once per day), then calls
+        generate_signals() once per trading day, reusing that same cache.
+
+        _save_signals()'s ON CONFLICT clause resets actual_close_10d/
+        actual_pct_10d/signal_correct to NULL on overwrite, so a subsequent
+        `--backtest --full` will actually re-evaluate every regenerated
+        signal instead of skipping it as already-scored.
+        """
+        if not self.xgb:
+            logger.error("No trained model. Run: python ai_signal_engine.py --train")
+            return
+
+        if not start_date:
+            earliest = db.one("SELECT MIN(signal_date) AS d FROM ai_signals")
+            start_date = (earliest.get("d") if earliest else None)
+            if not start_date:
+                logger.error("No existing signals to determine a start date — "
+                             "pass start_date explicitly.")
+                return
+        end_date = end_date or date.today().strftime("%Y-%m-%d")
+
+        # Build the list of NEPSE trading days in range
+        trading_days = []
+        d = date.fromisoformat(start_date)
+        end_d = date.fromisoformat(end_date)
+        while d <= end_d:
+            if d.weekday() in MARKET_DAYS and d.strftime("%Y-%m-%d") not in NEPSE_HOLIDAYS:
+                trading_days.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+
+        logger.info("=" * 55)
+        logger.info(f"  REGENERATING HISTORICAL SIGNALS: {start_date} → {end_date}")
+        logger.info(f"  {len(trading_days)} trading days to process")
+        logger.info("=" * 55)
+
+        cache_cutoff = (date.fromisoformat(start_date) - timedelta(days=365)).strftime("%Y-%m-%d")
+        stocks = db.all("SELECT symbol FROM stocks WHERE is_active=1")
+        logger.info(f"Preloading feature data for {len(stocks)} symbols ONCE "
+                    f"across the full date range (instead of once per day)...")
+        cache = _preload_feature_cache(cache_cutoff)
+        logger.info("Preload complete.")
+
+        total_buy = total_sell = 0
+        for i, d_str in enumerate(trading_days, 1):
+            sigs = self.generate_signals(signal_date=d_str, cache=cache, stocks=stocks)
+            buys  = sum(1 for s in sigs if s["signal"] == "BUY")
+            sells = sum(1 for s in sigs if s["signal"] == "SELL")
+            total_buy  += buys
+            total_sell += sells
+            logger.info(f"  [{i}/{len(trading_days)}] {d_str}: {buys} BUY, {sells} SELL "
+                        f"({len(sigs)-buys-sells} HOLD)")
+
+        logger.info(f"\nDone — regenerated signals for {len(trading_days)} days "
+                    f"({total_buy} BUY, {total_sell} SELL total).")
+        logger.info("Next: python ai_signal_engine.py --backtest --full")
+
     def fix_target_dates(self):
         """
         ONE-TIME MIGRATION.
@@ -1187,6 +1347,15 @@ if __name__ == "__main__":
     elif "--fix-target-dates" in sys.argv:
         model.fix_target_dates()
 
+    elif "--regenerate-historical" in sys.argv:
+        start_arg = end_arg = None
+        for a in sys.argv:
+            if a.startswith("--start="):
+                start_arg = a.split("=", 1)[1]
+            elif a.startswith("--end="):
+                end_arg = a.split("=", 1)[1]
+        model.regenerate_historical(start_date=start_arg, end_date=end_arg)
+
     elif "--backtest" in sys.argv:
         model.backtest(full="--full" in sys.argv)
 
@@ -1196,5 +1365,7 @@ if __name__ == "__main__":
         print("  python ai_signal_engine.py --train --lookback=2190")
         print("  python ai_signal_engine.py --signals")
         print("  python ai_signal_engine.py --fix-target-dates   (one-time migration)")
+        print("  python ai_signal_engine.py --regenerate-historical   (rebuild past signals with current model)")
+        print("  python ai_signal_engine.py --regenerate-historical --start=2026-06-21 --end=2026-07-09")
         print("  python ai_signal_engine.py --backtest")
         print("  python ai_signal_engine.py --backtest --full    (re-score all signals after migration)")
